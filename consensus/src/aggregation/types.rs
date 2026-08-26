@@ -44,9 +44,6 @@ pub enum Error {
     /// Duplicate acknowledgment for the same position
     #[error("Duplicate ack from sender {0} for position {1}")]
     AckDuplicate(String, Height),
-    /// The acknowledgement is for a position that already has a certificate
-    #[error("Ack for position {0} already has been certified")]
-    AckCertified(Height),
 }
 
 impl Error {
