@@ -29,7 +29,9 @@ pub struct Config<
     pub scheme: S,
     /// Proposes digests.
     pub automaton: A,
-    /// Receives durable local activities.
+    /// Receives activities after the engine syncs them to its journal.
+    ///
+    /// Reporter feedback does not confirm archival durability.
     pub reporter: Z,
     /// Blocker for invalid network messages.
     pub blocker: B,
