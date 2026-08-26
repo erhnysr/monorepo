@@ -6,7 +6,7 @@ use commonware_runtime::{
 /// Metrics for the [super::Engine].
 pub struct Metrics {
     /// Lowest height without a certificate
-    pub tip: Gauge,
+    pub frontier: Gauge,
     /// Number of digests returned by the automaton by status
     pub digest: status::Counter,
     /// Number of [super::types::Ack] messages processed by status
@@ -20,7 +20,7 @@ pub struct Metrics {
 impl Metrics {
     /// Create and return a new set of metrics, registered with the given context.
     pub fn init(context: &impl RuntimeMetrics) -> Self {
-        let tip = context.gauge("tip", "Lowest height without a certificate");
+        let frontier = context.gauge("frontier", "Lowest position without a certificate");
         let digest = context.family(
             "digest",
             "Number of digests returned by the automaton by status",
@@ -34,7 +34,7 @@ impl Metrics {
         );
 
         Self {
-            tip,
+            frontier,
             digest,
             acks,
             certificates,
