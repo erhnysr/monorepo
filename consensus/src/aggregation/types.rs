@@ -265,15 +265,6 @@ impl<S: Scheme, D: Digest> Certificate<S, D> {
         })
     }
 
-    /// Verifies the recovered certificate for the item.
-    pub fn verify<R>(&self, rng: &mut R, scheme: &S, strategy: &impl Strategy) -> bool
-    where
-        R: CryptoRng,
-        S: scheme::Scheme<D>,
-    {
-        scheme.verify_certificate::<_, D>(rng, &self.item, &self.certificate, strategy)
-    }
-
     /// Verifies that this certificate belongs to an engine and has a valid signature.
     ///
     /// The epoch and range checks happen before cryptographic verification because epoch is
@@ -294,7 +285,7 @@ impl<S: Scheme, D: Digest> Certificate<S, D> {
         self.epoch == epoch
             && self.item.position >= first
             && self.item.position <= last
-            && self.verify(rng, scheme, strategy)
+            && scheme.verify_certificate::<_, D>(rng, &self.item, &self.certificate, strategy)
     }
 }
 
@@ -488,7 +479,25 @@ mod tests {
 
         let certificate =
             Certificate::from_acks(&schemes[0], Epoch::new(1), &acks, &Sequential).unwrap();
-        assert!(certificate.verify(&mut rng, &schemes[0], &Sequential));
+        assert!(certificate.verify_for(
+            &mut rng,
+            &schemes[0],
+            Epoch::new(1),
+            Height::new(100),
+            Height::new(100),
+            &Sequential,
+        ));
+
+        let mut wrong_epoch = certificate.clone();
+        wrong_epoch.epoch = Epoch::new(2);
+        assert!(!wrong_epoch.verify_for(
+            &mut rng,
+            &schemes[0],
+            Epoch::new(1),
+            Height::new(100),
+            Height::new(100),
+            &Sequential,
+        ));
 
         let activity_certified = Activity::Certified(certificate.clone());
         let encoded_certified = activity_certified.encode();
@@ -497,7 +506,14 @@ mod tests {
         if let Activity::Certified(restored) = restored_activity_certified {
             assert_eq!(restored.item, item);
             assert_eq!(restored.epoch, Epoch::new(1));
-            assert!(restored.verify(&mut rng, &schemes[0], &Sequential));
+            assert!(restored.verify_for(
+                &mut rng,
+                &schemes[0],
+                Epoch::new(1),
+                Height::new(100),
+                Height::new(100),
+                &Sequential,
+            ));
         } else {
             panic!("Expected Activity::Certified");
         }

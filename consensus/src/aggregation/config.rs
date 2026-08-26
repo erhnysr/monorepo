@@ -1,5 +1,8 @@
 use super::{scheme, types::Activity};
-use crate::{Automaton, Reporter, types::{Epoch, Height}};
+use crate::{
+    Automaton, Reporter,
+    types::{Epoch, Height},
+};
 use commonware_cryptography::{Digest, certificate::Verifier};
 use commonware_p2p::Blocker;
 use commonware_parallel::Strategy;
@@ -16,10 +19,6 @@ pub struct Config<
     B: Blocker<PublicKey = <S as Verifier>::PublicKey>,
     T: Strategy,
 > {
-    /// Application namespace used to identify the engine journal.
-    ///
-    /// The signing scheme must be constructed with the same namespace.
-    pub namespace: Vec<u8>,
     /// Epoch represented by this engine.
     pub epoch: Epoch,
     /// First mandatory global position, inclusive.

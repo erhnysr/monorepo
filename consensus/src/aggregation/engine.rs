@@ -1,7 +1,13 @@
 //! Fixed per-epoch aggregation engine.
 
-use super::{Config, metrics, scheme, types::{Ack, Activity, Certificate, Error, Item}};
-use crate::{Automaton, Reporter, types::{Epoch, Height, Participant}};
+use super::{
+    Config, metrics, scheme,
+    types::{Ack, Activity, Certificate, Error, Item},
+};
+use crate::{
+    Automaton, Reporter,
+    types::{Epoch, Height, Participant},
+};
 use bytes::{Buf, BufMut};
 use commonware_actor::mailbox::{
     self, UnreliablePolicy, UnreliableReceiver as MailboxReceiver,
@@ -10,11 +16,16 @@ use commonware_actor::mailbox::{
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt, Write};
 use commonware_cryptography::{Digest, Hasher, Sha256, certificate::Verifier};
 use commonware_macros::select;
-use commonware_p2p::{Blocker, Receiver, Recipients, Sender, utils::codec::{WrappedSender, wrap}};
+use commonware_p2p::{
+    Blocker, Receiver, Recipients, Sender,
+    utils::codec::{WrappedSender, wrap},
+};
 use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, ContextCell, Handle, Metrics as RuntimeMetrics, ReadOptions, Spawner,
-    Storage, buffer::paged::CacheRef, spawn_cell,
+    Storage,
+    buffer::paged::CacheRef,
+    spawn_cell,
     telemetry::metrics::{GaugeExt, histogram, status::Status},
 };
 use commonware_storage::journal::segmented::variable::{Config as JournalConfig, Journal};
@@ -34,16 +45,14 @@ use std::{
 use tracing::{debug, info, warn};
 
 const JOURNAL_VERSION: u8 = 1;
-const JOURNAL_NAMESPACE_DOMAIN: &[u8] = b"_COMMONWARE_CONSENSUS_AGGREGATION_JOURNAL_NAMESPACE_V1";
 const JOURNAL_COMMITTEE_DOMAIN: &[u8] = b"_COMMONWARE_CONSENSUS_AGGREGATION_JOURNAL_COMMITTEE_V1";
-type NamespaceDigest = <Sha256 as Hasher>::Digest;
+type IdentityDigest = <Sha256 as Hasher>::Digest;
 
 /// The first record binds all subsequent trusted records to one engine identity.
 #[derive(Clone, Debug)]
 struct Header {
     version: u8,
-    namespace: NamespaceDigest,
-    committee: NamespaceDigest,
+    committee: IdentityDigest,
     epoch: Epoch,
     first: Height,
     last: Height,
@@ -53,7 +62,6 @@ struct Header {
 impl Write for Header {
     fn write(&self, writer: &mut impl BufMut) {
         self.version.write(writer);
-        self.namespace.write(writer);
         self.committee.write(writer);
         self.epoch.write(writer);
         self.first.write(writer);
@@ -68,8 +76,7 @@ impl Read for Header {
     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
         Ok(Self {
             version: u8::read(reader)?,
-            namespace: NamespaceDigest::read(reader)?,
-            committee: NamespaceDigest::read(reader)?,
+            committee: IdentityDigest::read(reader)?,
             epoch: Epoch::read(reader)?,
             first: Height::read(reader)?,
             last: Height::read(reader)?,
@@ -81,7 +88,6 @@ impl Read for Header {
 impl EncodeSize for Header {
     fn encode_size(&self) -> usize {
         self.version.encode_size()
-            + self.namespace.encode_size()
             + self.committee.encode_size()
             + self.epoch.encode_size()
             + self.first.encode_size()
@@ -99,8 +105,14 @@ enum Record<S: commonware_cryptography::certificate::Scheme, D: Digest> {
 impl<S: commonware_cryptography::certificate::Scheme, D: Digest> Write for Record<S, D> {
     fn write(&self, writer: &mut impl BufMut) {
         match self {
-            Self::Header(header) => { 0u8.write(writer); header.write(writer); }
-            Self::Activity(activity) => { 1u8.write(writer); activity.write(writer); }
+            Self::Header(header) => {
+                0u8.write(writer);
+                header.write(writer);
+            }
+            Self::Activity(activity) => {
+                1u8.write(writer);
+                activity.write(writer);
+            }
         }
     }
 }
@@ -112,14 +124,20 @@ impl<S: commonware_cryptography::certificate::Scheme, D: Digest> Read for Record
         match u8::read(reader)? {
             0 => Ok(Self::Header(Header::read(reader)?)),
             1 => Ok(Self::Activity(Activity::read_cfg(reader, cfg)?)),
-            _ => Err(CodecError::Invalid("consensus::aggregation::Record", "invalid type")),
+            _ => Err(CodecError::Invalid(
+                "consensus::aggregation::Record",
+                "invalid type",
+            )),
         }
     }
 }
 
 impl<S: commonware_cryptography::certificate::Scheme, D: Digest> EncodeSize for Record<S, D> {
     fn encode_size(&self) -> usize {
-        1 + match self { Self::Header(v) => v.encode_size(), Self::Activity(v) => v.encode_size() }
+        1 + match self {
+            Self::Header(v) => v.encode_size(),
+            Self::Activity(v) => v.encode_size(),
+        }
     }
 }
 
@@ -145,6 +163,15 @@ pub enum CertificateOutcome {
     Invalid,
     /// The bounded ingress queue was full; the caller should retry later.
     Backpressured,
+}
+
+/// Reason an aggregation engine stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineOutcome {
+    /// Every position in the configured range has a certificate.
+    Completed,
+    /// The engine stopped before certifying the full range.
+    Stopped,
 }
 
 struct CertificateMessage<S: commonware_cryptography::certificate::Scheme, D: Digest> {
@@ -198,7 +225,6 @@ where
     T: Strategy,
 {
     context: ContextCell<E>,
-    namespace: Vec<u8>,
     epoch: Epoch,
     first: Height,
     last: Height,
@@ -251,33 +277,47 @@ where
             mailbox::new_unreliable(context.child("mailbox"), mailbox_capacity);
         let mailbox = Mailbox { sender };
         let engine = Self {
-            context: ContextCell::new(context), namespace: cfg.namespace, epoch: cfg.epoch,
-            first: cfg.first, last: cfg.last, scheme: cfg.scheme, automaton: cfg.automaton,
-            reporter: cfg.reporter, blocker: cfg.blocker, strategy: cfg.strategy,
-            window: cfg.window.get(), frontier: cfg.first, complete: false,
-            digest_requests: FuturesPool::default(), digest_aborters: BTreeMap::new(),
+            context: ContextCell::new(context),
+            epoch: cfg.epoch,
+            first: cfg.first,
+            last: cfg.last,
+            scheme: cfg.scheme,
+            automaton: cfg.automaton,
+            reporter: cfg.reporter,
+            blocker: cfg.blocker,
+            strategy: cfg.strategy,
+            window: cfg.window.get(),
+            frontier: cfg.first,
+            complete: false,
+            digest_requests: FuturesPool::default(),
+            digest_aborters: BTreeMap::new(),
             pending: BTreeMap::new(),
-            confirmed: BTreeMap::new(), rebroadcast_timeout: cfg.rebroadcast_timeout.into(),
-            rebroadcast_deadlines: PrioritySet::new(), journal: None,
+            confirmed: BTreeMap::new(),
+            rebroadcast_timeout: cfg.rebroadcast_timeout.into(),
+            rebroadcast_deadlines: PrioritySet::new(),
+            journal: None,
             journal_partition: cfg.journal_partition,
             journal_write_buffer: cfg.journal_write_buffer,
             journal_replay_buffer: cfg.journal_replay_buffer,
             journal_heights_per_section: cfg.journal_heights_per_section,
-            journal_compression: cfg.journal_compression, journal_page_cache: cfg.journal_page_cache,
-            priority_acks: cfg.priority_acks, certificate_mailbox,
-            _certificate_sender: mailbox.clone(), metrics,
+            journal_compression: cfg.journal_compression,
+            journal_page_cache: cfg.journal_page_cache,
+            priority_acks: cfg.priority_acks,
+            certificate_mailbox,
+            _certificate_sender: mailbox.clone(),
+            metrics,
         };
         (engine, mailbox)
     }
 
-    /// Starts the engine and exits after the full inclusive range is certified.
+    /// Starts the engine and reports whether it completed or was stopped.
     pub fn start(
         self,
         network: (
             impl Sender<PublicKey = <S as Verifier>::PublicKey>,
             impl Receiver<PublicKey = <S as Verifier>::PublicKey>,
         ),
-    ) -> Handle<()> {
+    ) -> Handle<EngineOutcome> {
         let mut this = self;
         spawn_cell!(this.context, this.run(network))
     }
@@ -288,14 +328,22 @@ where
             impl Sender<PublicKey = <S as Verifier>::PublicKey>,
             impl Receiver<PublicKey = <S as Verifier>::PublicKey>,
         ),
-    ) {
-        let (mut sender, mut receiver) = wrap((), self.context.network_buffer_pool().clone(), network.0, network.1);
+    ) -> EngineOutcome {
+        let (mut sender, mut receiver) = wrap(
+            (),
+            self.context.network_buffer_pool().clone(),
+            network.0,
+            network.1,
+        );
         self.init_journal().await;
         self.fill_window();
         let _ = self.metrics.frontier.try_set(self.frontier.get());
         let mut shutdown = self.context.stopped();
         let mut network_first = true;
-        while !self.complete {
+        let outcome = loop {
+            if self.complete {
+                break EngineOutcome::Completed;
+            }
             let rebroadcast = match self.rebroadcast_deadlines.peek() {
                 Some((_, &deadline)) => Either::Left(self.context.sleep_until(deadline)),
                 None => Either::Right(future::pending()),
@@ -309,13 +357,13 @@ where
             };
             let event = if network_first {
                 select! {
-                    _ = &mut shutdown => { debug!("shutdown"); break; },
+                    _ = &mut shutdown => { debug!("shutdown"); break EngineOutcome::Stopped; },
                     message = receiver.recv() => Either::Left(message),
                     maintenance = maintenance => Either::Right(maintenance),
                 }
             } else {
                 select! {
-                    _ = &mut shutdown => { debug!("shutdown"); break; },
+                    _ = &mut shutdown => { debug!("shutdown"); break EngineOutcome::Stopped; },
                     maintenance = maintenance => Either::Right(maintenance),
                     message = receiver.recv() => Either::Left(message),
                 }
@@ -338,7 +386,12 @@ where
                     };
                     if let Err(err) = self.validate_ack(&ack, &peer) {
                         if err.blockable() {
-                            commonware_p2p::block!(self.blocker, peer, ?err, "ack validation failed");
+                            commonware_p2p::block!(
+                                self.blocker,
+                                peer,
+                                ?err,
+                                "ack validation failed"
+                            );
                         }
                         continue;
                     }
@@ -349,7 +402,9 @@ where
                     }
                 }
                 Either::Right(Either::Left(request)) => {
-                    let Ok(request) = request else { continue; };
+                    let Ok(request) = request else {
+                        continue;
+                    };
                     let DigestRequest {
                         position,
                         result,
@@ -386,20 +441,33 @@ where
                     response.send_lossy(outcome);
                 }
             }
-        }
+        };
 
         if let Some(journal) = self.journal.take() {
-            journal.sync_all().await.expect("unable to sync aggregation journal");
+            journal
+                .sync_all()
+                .await
+                .expect("unable to sync aggregation journal");
         }
+        outcome
     }
 
     fn fill_window(&mut self) {
-        if self.complete { return; }
-        let end = self.frontier.get().saturating_add(self.window - 1).min(self.last.get());
+        if self.complete {
+            return;
+        }
+        let end = self
+            .frontier
+            .get()
+            .saturating_add(self.window - 1)
+            .min(self.last.get());
         for raw in self.frontier.get()..=end {
             let position = Height::new(raw);
-            if self.pending.contains_key(&position) || self.confirmed.contains_key(&position) { continue; }
-            self.pending.insert(position, Pending::Unverified(BTreeMap::new()));
+            if self.pending.contains_key(&position) || self.confirmed.contains_key(&position) {
+                continue;
+            }
+            self.pending
+                .insert(position, Pending::Unverified(BTreeMap::new()));
             self.request_digest(position);
         }
         debug_assert!(self.pending.len() + self.confirmed.len() <= self.window as usize);
@@ -410,8 +478,16 @@ where
         let mut automaton = self.automaton.clone();
         let timer = self.metrics.digest_duration.timer(self.context.as_ref());
         let aborter = self.digest_requests.push(async move {
-            let result = automaton.propose(position).await.await.map_err(Error::AppProposeCanceled);
-            DigestRequest { position, result, timer }
+            let result = automaton
+                .propose(position)
+                .await
+                .await
+                .map_err(Error::AppProposeCanceled);
+            DigestRequest {
+                position,
+                result,
+                timer,
+            }
         });
         assert!(self.digest_aborters.insert(position, aborter).is_none());
     }
@@ -422,34 +498,63 @@ where
         digest: D,
         sender: &mut WrappedSender<impl Sender<PublicKey = <S as Verifier>::PublicKey>, Ack<S, D>>,
     ) {
-        let Some(Pending::Unverified(shares)) = self.pending.remove(&position) else { return; };
-        let matching = shares.into_iter().filter(|(_, ack)| ack.item.digest == digest).collect();
-        self.pending.insert(position, Pending::Verified(digest, matching));
-        let Some(ack) = Ack::sign(&self.scheme, Item { position, digest }) else { return; };
+        let Some(Pending::Unverified(shares)) = self.pending.remove(&position) else {
+            return;
+        };
+        let matching = shares
+            .into_iter()
+            .filter(|(_, ack)| ack.item.digest == digest)
+            .collect();
+        self.pending
+            .insert(position, Pending::Verified(digest, matching));
+        let Some(ack) = Ack::sign(&self.scheme, Item { position, digest }) else {
+            return;
+        };
         self.record(Activity::Ack(ack.clone())).await;
         self.reporter.report(Activity::Ack(ack.clone()));
-        self.rebroadcast_deadlines.put(position, self.context.current() + self.rebroadcast_timeout);
+        self.rebroadcast_deadlines
+            .put(position, self.context.current() + self.rebroadcast_timeout);
         self.insert_ack(ack.clone()).await;
         if self.pending.contains_key(&position) {
             sender.send(Recipients::All, ack, self.priority_acks);
         }
     }
 
-    fn validate_ack(&mut self, ack: &Ack<S, D>, peer: &<S as Verifier>::PublicKey) -> Result<(), Error> {
+    fn validate_ack(
+        &mut self,
+        ack: &Ack<S, D>,
+        peer: &<S as Verifier>::PublicKey,
+    ) -> Result<(), Error> {
         let position = ack.item.position;
-        if position < self.first || position > self.last || self.complete || position < self.frontier
+        if position < self.first
+            || position > self.last
+            || self.complete
+            || position < self.frontier
             || position.get() >= self.frontier.get().saturating_add(self.window)
             || !self.pending.contains_key(&position)
-        { return Err(Error::AckPosition(position)); }
-        let Some(signer) = self.scheme.participants().index(peer) else { return Err(Error::PeerMismatch); };
-        if signer != ack.attestation.signer { return Err(Error::PeerMismatch); }
+        {
+            return Err(Error::AckPosition(position));
+        }
+        let Some(signer) = self.scheme.participants().index(peer) else {
+            return Err(Error::PeerMismatch);
+        };
+        if signer != ack.attestation.signer {
+            return Err(Error::PeerMismatch);
+        }
         match self.pending.get(&position).expect("checked") {
-            Pending::Verified(digest, shares) if *digest != ack.item.digest => return Err(Error::AckDigest(position)),
-            Pending::Verified(_, shares) | Pending::Unverified(shares) if shares.contains_key(&signer) =>
-                return Err(Error::AckDuplicate(peer.to_string(), position)),
+            Pending::Verified(digest, shares) if *digest != ack.item.digest => {
+                return Err(Error::AckDigest(position));
+            }
+            Pending::Verified(_, shares) | Pending::Unverified(shares)
+                if shares.contains_key(&signer) =>
+            {
+                return Err(Error::AckDuplicate(peer.to_string(), position));
+            }
             _ => {}
         }
-        if !ack.verify(self.context.as_mut(), &self.scheme, &self.strategy) { return Err(Error::InvalidAckSignature); }
+        if !ack.verify(self.context.as_mut(), &self.scheme, &self.strategy) {
+            return Err(Error::InvalidAckSignature);
+        }
         Ok(())
     }
 
@@ -459,7 +564,9 @@ where
 
     async fn insert_ack(&mut self, ack: Ack<S, D>) -> bool {
         let position = ack.item.position;
-        let Some(pending) = self.pending.get_mut(&position) else { return false; };
+        let Some(pending) = self.pending.get_mut(&position) else {
+            return false;
+        };
         let shares = match pending {
             Pending::Unverified(shares) => shares,
             Pending::Verified(digest, _) if *digest != ack.item.digest => return false,
@@ -467,29 +574,48 @@ where
         };
         shares.entry(ack.attestation.signer).or_insert(ack.clone());
         let quorum = self.scheme.participants().quorum::<S::Faults>() as usize;
-        let matching: Vec<_> = shares.values().filter(|other| other.item.digest == ack.item.digest).collect();
-        if matching.len() < quorum { return true; }
-        let Some(certificate) = Certificate::from_acks(&self.scheme, self.epoch, matching, &self.strategy) else { return false; };
+        let matching: Vec<_> = shares
+            .values()
+            .filter(|other| other.item.digest == ack.item.digest)
+            .collect();
+        if matching.len() < quorum {
+            return true;
+        }
+        let Some(certificate) =
+            Certificate::from_acks(&self.scheme, self.epoch, matching, &self.strategy)
+        else {
+            return false;
+        };
         self.accept_certificate(certificate).await;
         true
     }
 
     async fn accept_certificate(&mut self, certificate: Certificate<S, D>) {
         let position = certificate.item.position;
-        if certificate.epoch != self.epoch || position < self.frontier || position > self.last { return; }
+        if certificate.epoch != self.epoch || position < self.frontier || position > self.last {
+            return;
+        }
         if let Some(existing) = self.confirmed.get(&position) {
-            assert_eq!(existing.item.digest, certificate.item.digest, "conflicting certificates");
+            assert_eq!(
+                existing.item.digest, certificate.item.digest,
+                "conflicting certificates"
+            );
             return;
         }
         self.record(Activity::Certified(certificate.clone())).await;
-        self.reporter.report(Activity::Certified(certificate.clone()));
+        self.reporter
+            .report(Activity::Certified(certificate.clone()));
         self.pending.remove(&position);
         self.digest_aborters.remove(&position);
         self.rebroadcast_deadlines.remove(&position);
         self.confirmed.insert(position, certificate);
         self.metrics.certificates.inc();
         while self.confirmed.remove(&self.frontier).is_some() {
-            if self.frontier == self.last { self.complete = true; break; }
+            if self.frontier == self.last {
+                self.complete = true;
+                let _ = self.metrics.complete.try_set(1);
+                break;
+            }
             self.frontier = self.frontier.next();
         }
         let _ = self.metrics.frontier.try_set(self.frontier.get());
@@ -504,23 +630,20 @@ where
         if certificate.epoch != self.epoch || position < self.first || position > self.last {
             return CertificateOutcome::Invalid;
         }
-        if self.complete
-            || position < self.frontier
-            || self.confirmed.contains_key(&position)
-        {
+        if self.complete || position < self.frontier || self.confirmed.contains_key(&position) {
             return CertificateOutcome::Ignored;
         }
         if !self.pending.contains_key(&position) {
             return CertificateOutcome::Ignored;
         }
         if !certificate.verify_for(
-                self.context.as_mut(),
-                &self.scheme,
-                self.epoch,
-                self.first,
-                self.last,
-                &self.strategy,
-            ) {
+            self.context.as_mut(),
+            &self.scheme,
+            self.epoch,
+            self.first,
+            self.last,
+            &self.strategy,
+        ) {
             return CertificateOutcome::Invalid;
         }
         self.accept_certificate(certificate).await;
@@ -532,21 +655,25 @@ where
         position: Height,
         sender: &mut WrappedSender<impl Sender<PublicKey = <S as Verifier>::PublicKey>, Ack<S, D>>,
     ) {
-        let Some(me) = self.scheme.me() else { return; };
-        let Some(Pending::Verified(_, shares)) = self.pending.get(&position) else { return; };
-        let Some(ack) = shares.get(&me).cloned() else { return; };
-        self.rebroadcast_deadlines.put(position, self.context.current() + self.rebroadcast_timeout);
+        let Some(me) = self.scheme.me() else {
+            return;
+        };
+        let Some(Pending::Verified(_, shares)) = self.pending.get(&position) else {
+            return;
+        };
+        let Some(ack) = shares.get(&me).cloned() else {
+            return;
+        };
+        self.rebroadcast_deadlines
+            .put(position, self.context.current() + self.rebroadcast_timeout);
         sender.send(Recipients::All, ack, self.priority_acks);
     }
 
     fn expected_header(&self) -> Header {
-        // Hashing a fixed domain and the exact namespace gives a stable collision-resistant identity.
-        let namespace = Sha256::hash(&[JOURNAL_NAMESPACE_DOMAIN, &self.namespace]);
         let participants = self.scheme.participants().encode();
         let committee = Sha256::hash(&[JOURNAL_COMMITTEE_DOMAIN, participants.as_ref()]);
         Header {
             version: JOURNAL_VERSION,
-            namespace,
             committee,
             epoch: self.epoch,
             first: self.first,
@@ -557,27 +684,50 @@ where
 
     async fn init_journal(&mut self) {
         let cfg = JournalConfig {
-            partition: self.journal_partition.clone(), compression: self.journal_compression,
+            partition: self.journal_partition.clone(),
+            compression: self.journal_compression,
             codec_config: S::certificate_codec_config_unbounded(),
-            page_cache: self.journal_page_cache.clone(), write_buffer: self.journal_write_buffer,
+            page_cache: self.journal_page_cache.clone(),
+            write_buffer: self.journal_write_buffer,
         };
-        let journal = Journal::init(self.context.child("journal"), cfg).await.expect("aggregation journal init failed");
+        let journal = Journal::init(self.context.child("journal"), cfg)
+            .await
+            .expect("aggregation journal init failed");
         let empty = journal.is_empty();
-        let mut replay = journal.replay(0, 0, self.journal_replay_buffer, ReadOptions::DONT_CACHE)
-            .await.expect("aggregation journal replay failed");
+        let mut replay = journal
+            .replay(0, 0, self.journal_replay_buffer, ReadOptions::DONT_CACHE)
+            .await
+            .expect("aggregation journal replay failed");
         let expected = self.expected_header();
         let mut first_record = true;
         while let Some(record) = replay.next().await {
             let (_, _, _, record) = record.expect("corrupt aggregation journal");
             match (first_record, record) {
                 (true, Record::Header(header)) => {
-                    assert_eq!(header.version, expected.version, "aggregation journal version mismatch");
-                    assert_eq!(header.namespace, expected.namespace, "aggregation journal namespace mismatch");
-                    assert_eq!(header.committee, expected.committee, "aggregation journal committee mismatch");
-                    assert_eq!(header.epoch, expected.epoch, "aggregation journal epoch mismatch");
-                    assert_eq!(header.first, expected.first, "aggregation journal first-position mismatch");
-                    assert_eq!(header.last, expected.last, "aggregation journal last-position mismatch");
-                    assert_eq!(header.window, expected.window, "aggregation journal window mismatch");
+                    assert_eq!(
+                        header.version, expected.version,
+                        "aggregation journal version mismatch"
+                    );
+                    assert_eq!(
+                        header.committee, expected.committee,
+                        "aggregation journal committee mismatch"
+                    );
+                    assert_eq!(
+                        header.epoch, expected.epoch,
+                        "aggregation journal epoch mismatch"
+                    );
+                    assert_eq!(
+                        header.first, expected.first,
+                        "aggregation journal first-position mismatch"
+                    );
+                    assert_eq!(
+                        header.last, expected.last,
+                        "aggregation journal last-position mismatch"
+                    );
+                    assert_eq!(
+                        header.window, expected.window,
+                        "aggregation journal window mismatch"
+                    );
                 }
                 (true, _) => panic!("aggregation journal header missing"),
                 (false, Record::Header(_)) => panic!("duplicate aggregation journal header"),
@@ -588,7 +738,10 @@ where
         let journal = replay.finish().expect("aggregation journal replay failed");
         if empty {
             assert!(first_record);
-            let (journal, _, _) = journal.append(0, &Record::Header(expected)).await.expect("journal header append failed");
+            let (journal, _, _) = journal
+                .append(0, &Record::Header(expected))
+                .await
+                .expect("journal header append failed");
             self.journal = Some(journal.sync(0).await.expect("journal header sync failed"));
         } else {
             assert!(!first_record, "aggregation journal header missing");
@@ -596,7 +749,8 @@ where
         }
         for (&position, pending) in &self.pending {
             if matches!(pending, Pending::Verified(_, _)) {
-                self.rebroadcast_deadlines.put(position, self.context.current());
+                self.rebroadcast_deadlines
+                    .put(position, self.context.current());
             }
         }
         info!(epoch = %self.epoch, first = %self.first, last = %self.last, frontier = %self.frontier, "replayed aggregation journal");
@@ -606,14 +760,24 @@ where
         match &activity {
             Activity::Ack(ack) => {
                 let position = ack.item.position;
-                assert!(position >= self.first && position <= self.last, "journal ack outside range");
-                assert_eq!(Some(ack.attestation.signer), self.scheme.me(), "journal ack signer mismatch");
+                assert!(
+                    position >= self.first && position <= self.last,
+                    "journal ack outside range"
+                );
+                assert_eq!(
+                    Some(ack.attestation.signer),
+                    self.scheme.me(),
+                    "journal ack signer mismatch"
+                );
                 assert!(
                     ack.verify(self.context.as_mut(), &self.scheme, &self.strategy),
                     "journal ack signature mismatch"
                 );
                 if position >= self.frontier {
-                    let entry = self.pending.entry(position).or_insert_with(|| Pending::Verified(ack.item.digest, BTreeMap::new()));
+                    let entry = self
+                        .pending
+                        .entry(position)
+                        .or_insert_with(|| Pending::Verified(ack.item.digest, BTreeMap::new()));
                     match entry {
                         Pending::Verified(digest, shares) => {
                             assert_eq!(*digest, ack.item.digest, "conflicting local journal acks");
@@ -625,8 +789,14 @@ where
             }
             Activity::Certified(certificate) => {
                 let position = certificate.item.position;
-                assert_eq!(certificate.epoch, self.epoch, "journal certificate epoch mismatch");
-                assert!(position >= self.first && position <= self.last, "journal certificate outside range");
+                assert_eq!(
+                    certificate.epoch, self.epoch,
+                    "journal certificate epoch mismatch"
+                );
+                assert!(
+                    position >= self.first && position <= self.last,
+                    "journal certificate outside range"
+                );
                 assert!(
                     certificate.verify_for(
                         self.context.as_mut(),
@@ -643,11 +813,18 @@ where
                         assert_eq!(*digest, certificate.item.digest, "journal digest conflict");
                     }
                     if let Some(existing) = self.confirmed.insert(position, certificate.clone()) {
-                        assert_eq!(existing.item.digest, certificate.item.digest, "conflicting journal certificates");
+                        assert_eq!(
+                            existing.item.digest, certificate.item.digest,
+                            "conflicting journal certificates"
+                        );
                     }
                     self.pending.remove(&position);
                     while self.confirmed.remove(&self.frontier).is_some() {
-                        if self.frontier == self.last { self.complete = true; break; }
+                        if self.frontier == self.last {
+                            self.complete = true;
+                            let _ = self.metrics.complete.try_set(1);
+                            break;
+                        }
                         self.frontier = self.frontier.next();
                     }
                 }
@@ -657,11 +834,19 @@ where
     }
 
     async fn record(&mut self, activity: Activity<S, D>) {
-        let position = match &activity { Activity::Ack(v) => v.item.position, Activity::Certified(v) => v.item.position };
+        let position = match &activity {
+            Activity::Ack(v) => v.item.position,
+            Activity::Certified(v) => v.item.position,
+        };
         let section = position.get() / self.journal_heights_per_section.get();
         let record = Record::Activity(activity);
-        rebind(&mut self.journal, |journal| journal.append(section, &record))
-            .await.expect("unable to append aggregation journal");
-        rebind(&mut self.journal, |journal| journal.sync(section)).await.expect("unable to sync aggregation journal");
+        rebind(&mut self.journal, |journal| {
+            journal.append(section, &record)
+        })
+        .await
+        .expect("unable to append aggregation journal");
+        rebind(&mut self.journal, |journal| journal.sync(section))
+            .await
+            .expect("unable to sync aggregation journal");
     }
 }

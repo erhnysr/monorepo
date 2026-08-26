@@ -1,7 +1,8 @@
 //! Recover certificates for every position in a fixed per-epoch range.
 //!
-//! Each [`Engine`] has one immutable application namespace, epoch, inclusive global position
-//! range, and signing scheme. It requests and signs every position in that range, keeps a bounded
+//! Each [`Engine`] has one immutable epoch, inclusive global position range, and signing scheme.
+//! The signing scheme is the sole source of the application namespace. The engine requests and
+//! signs every position in that range, keeps a bounded
 //! window anchored at the lowest uncertified position, and exits only after the entire range is
 //! certified. A durable identity header prevents a journal from being replayed under different
 //! configuration.
@@ -19,7 +20,7 @@ cfg_if::cfg_if! {
         mod config;
         pub use config::Config;
         mod engine;
-        pub use engine::{CertificateOutcome, Engine, Mailbox};
+        pub use engine::{CertificateOutcome, Engine, EngineOutcome, Mailbox};
         mod metrics;
 
         #[cfg(test)]

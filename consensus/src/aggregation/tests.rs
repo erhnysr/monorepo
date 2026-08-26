@@ -1,5 +1,5 @@
 use super::{
-    CertificateOutcome, Config, Engine,
+    CertificateOutcome, Config, Engine, EngineOutcome,
     scheme::{self, Scheme},
     types::{Ack, Activity, Certificate, Item},
 };
@@ -23,11 +23,7 @@ use commonware_runtime::{
     deterministic::{self, Context},
 };
 use commonware_utils::{
-    NZU16, NZUsize, NonZeroDuration,
-    channel::oneshot,
-    ordered::Quorum,
-    probability,
-    sync::Mutex,
+    NZU16, NZUsize, NonZeroDuration, channel::oneshot, ordered::Quorum, probability, sync::Mutex,
 };
 use futures::future::join_all;
 use std::{
@@ -172,7 +168,6 @@ async fn simulation<S: Scheme<Sha256Digest, PublicKey = PublicKey>>(
 
 struct EngineScope {
     partition: String,
-    namespace: Vec<u8>,
     epoch: Epoch,
     first: Height,
     last: Height,
@@ -192,7 +187,6 @@ where
     A: Automaton<Context = Height, Digest = Sha256Digest>,
 {
     Config {
-        namespace: scope.namespace,
         epoch: scope.epoch,
         first: scope.first,
         last: scope.last,
@@ -229,9 +223,7 @@ where
         let mut observations = Vec::new();
 
         for (index, participant) in fixture.participants.iter().enumerate() {
-            let child = context
-                .child("validator")
-                .with_attribute("index", index);
+            let child = context.child("validator").with_attribute("index", index);
             let application = ImmediateApplication::default();
             let requested = application.requested.clone();
             let reporter = RecordingReporter::default();
@@ -244,7 +236,6 @@ where
                 oracle.control(participant.clone()),
                 EngineScope {
                     partition: format!("aggregation-{index}"),
-                    namespace: NAMESPACE.to_vec(),
                     epoch,
                     first,
                     last,
@@ -258,12 +249,19 @@ where
         }
 
         for result in join_all(handles).await {
-            result.expect("aggregation engine failed");
+            assert_eq!(
+                result.expect("aggregation engine failed"),
+                EngineOutcome::Completed
+            );
         }
         for (requested, activities) in observations {
             let requested = requested.lock();
             assert_eq!(requested.len(), 16);
-            assert!(requested.iter().all(|position| *position >= first && *position <= last));
+            assert!(
+                requested
+                    .iter()
+                    .all(|position| *position >= first && *position <= last)
+            );
 
             let activities = activities.lock();
             let certificates: BTreeMap<_, _> = activities
@@ -311,7 +309,6 @@ where
             oracle.control(participant.clone()),
             EngineScope {
                 partition: "aggregation-ingress".into(),
-                namespace: NAMESPACE.to_vec(),
                 epoch,
                 first: position,
                 last: position,
@@ -336,17 +333,15 @@ where
             .take(quorum)
             .map(|scheme| Ack::sign(scheme, item.clone()).unwrap())
             .collect();
-        let certificate = Certificate::from_acks(
-            &fixture.schemes[0],
-            epoch,
-            &acks,
-            &Sequential,
-        )
-        .unwrap();
+        let certificate =
+            Certificate::from_acks(&fixture.schemes[0], epoch, &acks, &Sequential).unwrap();
 
         let mut wrong_epoch = certificate.clone();
         wrong_epoch.epoch = epoch.next();
-        assert_eq!(mailbox.submit(wrong_epoch).await, CertificateOutcome::Invalid);
+        assert_eq!(
+            mailbox.submit(wrong_epoch).await,
+            CertificateOutcome::Invalid
+        );
 
         let mut outside = certificate.clone();
         outside.item.position = position.next();
@@ -355,8 +350,14 @@ where
         let mut invalid = certificate.clone();
         invalid.item.digest = Sha256::hash(&[b"invalid"]);
         assert_eq!(mailbox.submit(invalid).await, CertificateOutcome::Invalid);
-        assert_eq!(mailbox.submit(certificate).await, CertificateOutcome::Accepted);
-        handle.await.expect("aggregation engine failed");
+        assert_eq!(
+            mailbox.submit(certificate).await,
+            CertificateOutcome::Accepted
+        );
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Completed
+        );
 
         let pending_sender = requested.lock().remove(&position).unwrap();
         assert!(pending_sender.send(digest(position)).is_err());
@@ -368,7 +369,11 @@ where
                 .count(),
             1
         );
-        assert!(!activities.iter().any(|activity| matches!(activity, Activity::Ack(_))));
+        assert!(
+            !activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::Ack(_)))
+        );
     });
 }
 
@@ -393,7 +398,6 @@ fn test_certificate_ingress_is_bounded() {
             oracle.control(participant),
             EngineScope {
                 partition: "aggregation-bounded-ingress".into(),
-                namespace: NAMESPACE.to_vec(),
                 epoch,
                 first: position,
                 last: position,
@@ -440,6 +444,45 @@ fn test_certificate_ingress_is_bounded() {
     });
 }
 
+#[test_traced("INFO")]
+fn test_shutdown_reports_stopped() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 1);
+        let participant = fixture.participants[0].clone();
+        let position = Height::new(70);
+        let application = PendingApplication::default();
+        let requested = application.requested.clone();
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, false).await;
+        let cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            application,
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: "aggregation-shutdown".into(),
+                epoch: Epoch::new(11),
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        let (engine, _mailbox) = Engine::new(context.child("engine"), cfg);
+        let handle = engine.start(registrations.remove(&participant).unwrap());
+
+        while !requested.lock().contains_key(&position) {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        context.child("stop").stop(0, None).await.unwrap();
+
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Stopped
+        );
+    });
+}
+
 fn journal_identity<S, F>(fixture: F)
 where
     S: Scheme<Sha256Digest, PublicKey = PublicKey>,
@@ -464,7 +507,6 @@ where
             first_oracle.control(participant.clone()),
             EngineScope {
                 partition: partition.into(),
-                namespace: NAMESPACE.to_vec(),
                 epoch,
                 first: position,
                 last: position,
@@ -472,10 +514,13 @@ where
             },
         );
         let (first_engine, _mailbox) = Engine::new(context.child("first_engine"), first_cfg);
-        first_engine
-            .start(first_registrations.remove(&participant).unwrap())
-            .await
-            .expect("first aggregation engine failed");
+        assert_eq!(
+            first_engine
+                .start(first_registrations.remove(&participant).unwrap())
+                .await
+                .expect("first aggregation engine failed"),
+            EngineOutcome::Completed
+        );
         assert_eq!(
             first_activities
                 .lock()
@@ -499,7 +544,6 @@ where
             second_oracle.control(participant.clone()),
             EngineScope {
                 partition: partition.into(),
-                namespace: NAMESPACE.to_vec(),
                 epoch,
                 first: position,
                 last: position,
@@ -507,10 +551,13 @@ where
             },
         );
         let (replay_engine, _mailbox) = Engine::new(context.child("replay_engine"), replay_cfg);
-        replay_engine
-            .start(second_registrations.remove(&participant).unwrap())
-            .await
-            .expect("replayed aggregation engine failed");
+        assert_eq!(
+            replay_engine
+                .start(second_registrations.remove(&participant).unwrap())
+                .await
+                .expect("replayed aggregation engine failed"),
+            EngineOutcome::Completed
+        );
         assert!(replay_requests.lock().is_empty());
         assert_eq!(
             replay_activities
@@ -520,7 +567,6 @@ where
                 .count(),
             1
         );
-
     });
 }
 
@@ -529,13 +575,9 @@ fn test_journal_replay_binds_engine_identity() {
     journal_identity(scheme::ed25519::fixture);
 }
 
-fn journal_identity_mismatch<S, F>(fixture: F)
-where
-    S: Scheme<Sha256Digest, PublicKey = PublicKey>,
-    F: FnOnce(&mut Context, &[u8], u32) -> Fixture<S>,
-{
+fn journal_namespace_mismatch() {
     deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
-        let fixture = fixture(&mut context, NAMESPACE, 1);
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 1);
         let participant = fixture.participants[0].clone();
         let epoch = Epoch::new(12);
         let position = Height::new(90);
@@ -551,7 +593,6 @@ where
             first_oracle.control(participant.clone()),
             EngineScope {
                 partition: partition.into(),
-                namespace: NAMESPACE.to_vec(),
                 epoch,
                 first: position,
                 last: position,
@@ -559,22 +600,30 @@ where
             },
         );
         let (first_engine, _mailbox) = Engine::new(context.child("first_engine"), first_cfg);
-        first_engine
-            .start(first_registrations.remove(&participant).unwrap())
-            .await
-            .expect("first aggregation engine failed");
+        assert_eq!(
+            first_engine
+                .start(first_registrations.remove(&participant).unwrap())
+                .await
+                .expect("first aggregation engine failed"),
+            EngineOutcome::Completed
+        );
 
         let (mismatch_oracle, mut mismatch_registrations) =
             simulation(context.child("mismatch_simulation"), &fixture, false).await;
+        let mismatch_scheme = scheme::ed25519::Scheme::signer(
+            b"different namespace",
+            fixture.schemes[0].participants().clone(),
+            fixture.private_keys[0].clone(),
+        )
+        .unwrap();
         let mismatch_cfg = config(
             &context,
-            fixture.schemes[0].clone(),
+            mismatch_scheme,
             ImmediateApplication::default(),
             RecordingReporter::default(),
             mismatch_oracle.control(participant.clone()),
             EngineScope {
                 partition: partition.into(),
-                namespace: b"different namespace".to_vec(),
                 epoch,
                 first: position,
                 last: position,
@@ -590,9 +639,9 @@ where
 }
 
 #[test_traced("INFO")]
-#[should_panic(expected = "aggregation journal namespace mismatch")]
-fn test_journal_rejects_identity_mismatch() {
-    journal_identity_mismatch(scheme::ed25519::fixture);
+#[should_panic(expected = "journal ack signature mismatch")]
+fn test_journal_rejects_signing_namespace_mismatch() {
+    journal_namespace_mismatch();
 }
 
 fn journal_window_mismatch<S, F>(fixture: F)
@@ -617,7 +666,6 @@ where
             first_oracle.control(participant.clone()),
             EngineScope {
                 partition: partition.into(),
-                namespace: NAMESPACE.to_vec(),
                 epoch,
                 first: position,
                 last: position,
@@ -640,7 +688,6 @@ where
             mismatch_oracle.control(participant.clone()),
             EngineScope {
                 partition: partition.into(),
-                namespace: NAMESPACE.to_vec(),
                 epoch,
                 first: position,
                 last: position,
@@ -683,7 +730,6 @@ where
             first_oracle.control(first_participant.clone()),
             EngineScope {
                 partition: partition.into(),
-                namespace: NAMESPACE.to_vec(),
                 epoch,
                 first: position,
                 last: position,
@@ -698,12 +744,8 @@ where
 
         let second_fixture = fixture(&mut context, NAMESPACE, 1);
         let second_participant = second_fixture.participants[0].clone();
-        let (mismatch_oracle, mut mismatch_registrations) = simulation(
-            context.child("mismatch_simulation"),
-            &second_fixture,
-            false,
-        )
-        .await;
+        let (mismatch_oracle, mut mismatch_registrations) =
+            simulation(context.child("mismatch_simulation"), &second_fixture, false).await;
         let mismatch_cfg = config(
             &context,
             second_fixture.schemes[0].clone(),
@@ -712,7 +754,6 @@ where
             mismatch_oracle.control(second_participant.clone()),
             EngineScope {
                 partition: partition.into(),
-                namespace: NAMESPACE.to_vec(),
                 epoch,
                 first: position,
                 last: position,

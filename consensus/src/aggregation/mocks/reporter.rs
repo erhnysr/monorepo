@@ -1,10 +1,16 @@
 use crate::aggregation::types::{Activity, Certificate};
-use commonware_actor::{Feedback, mailbox::{self, Policy, Receiver, Sender}};
+use commonware_actor::{
+    Feedback,
+    mailbox::{self, Policy, Receiver, Sender},
+};
 use commonware_cryptography::{Digest, certificate::Scheme};
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use commonware_utils::{NZUsize, channel::oneshot};
 use rand_core::CryptoRng;
-use std::{collections::{BTreeMap, VecDeque}, marker::PhantomData};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    marker::PhantomData,
+};
 
 enum Message<S: Scheme, D: Digest> {
     Activity(Activity<S, D>),
@@ -13,7 +19,9 @@ enum Message<S: Scheme, D: Digest> {
 
 impl<S: Scheme, D: Digest> Policy for Message<S, D> {
     type Overflow = VecDeque<Self>;
-    fn handle(overflow: &mut Self::Overflow, message: Self) { overflow.push_back(message); }
+    fn handle(overflow: &mut Self::Overflow, message: Self) {
+        overflow.push_back(message);
+    }
 }
 
 pub struct Reporter<R: CryptoRng, S: Scheme, D: Digest> {
@@ -26,30 +34,50 @@ pub struct Reporter<R: CryptoRng, S: Scheme, D: Digest> {
 impl<R: CryptoRng + Metrics, S: Scheme, D: Digest> Reporter<R, S, D> {
     pub fn new(context: R, _scheme: S) -> (Self, Mailbox<S, D>) {
         let (sender, mailbox) = mailbox::new(context.child("mailbox"), NZUsize!(1024));
-        (Self { context: ContextCell::new(context), mailbox, certificates: BTreeMap::new(), _scheme: PhantomData }, Mailbox { sender })
+        (
+            Self {
+                context: ContextCell::new(context),
+                mailbox,
+                certificates: BTreeMap::new(),
+                _scheme: PhantomData,
+            },
+            Mailbox { sender },
+        )
     }
 
-    pub fn start(mut self) -> Handle<()> where R: Spawner { spawn_cell!(self.context, self.run()) }
+    pub fn start(mut self) -> Handle<()>
+    where
+        R: Spawner,
+    {
+        spawn_cell!(self.context, self.run())
+    }
 
     async fn run(mut self) {
         while let Some(message) = self.mailbox.recv().await {
             match message {
                 Message::Activity(Activity::Certified(certificate)) => {
-                    self.certificates.insert(certificate.item.position, certificate);
+                    self.certificates
+                        .insert(certificate.item.position, certificate);
                 }
                 Message::Activity(Activity::Ack(_)) => {}
-                Message::Get(sender) => { sender.send(self.certificates.clone()).unwrap(); }
+                Message::Get(sender) => {
+                    sender.send(self.certificates.clone()).unwrap();
+                }
             }
         }
     }
 }
 
 #[derive(Clone)]
-pub struct Mailbox<S: Scheme, D: Digest> { sender: Sender<Message<S, D>> }
+pub struct Mailbox<S: Scheme, D: Digest> {
+    sender: Sender<Message<S, D>>,
+}
 
 impl<S: Scheme, D: Digest> crate::Reporter for Mailbox<S, D> {
     type Activity = Activity<S, D>;
-    fn report(&mut self, activity: Self::Activity) -> Feedback { self.sender.enqueue(Message::Activity(activity)) }
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
+        self.sender.enqueue(Message::Activity(activity))
+    }
 }
 
 impl<S: Scheme, D: Digest> Mailbox<S, D> {
