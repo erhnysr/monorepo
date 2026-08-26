@@ -28,6 +28,10 @@ pub struct Config<
     /// Fixed signing scheme for `epoch`.
     pub scheme: S,
     /// Proposes digests.
+    ///
+    /// Closing a proposal response declines the position for this engine instance. The engine will
+    /// not sign that position. The position can still complete from a learned certificate or after
+    /// restart.
     pub automaton: A,
     /// Receives activities after the engine syncs them to its journal.
     ///
@@ -40,6 +44,8 @@ pub struct Config<
     /// How often an acknowledgment is rebroadcast until certification.
     pub rebroadcast_timeout: NonZeroDuration,
     /// Maximum number of live positions.
+    ///
+    /// This value must remain unchanged while retaining the engine's journal.
     pub window: NonZeroU64,
     /// Journal partition.
     pub journal_partition: String,

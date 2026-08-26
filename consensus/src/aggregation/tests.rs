@@ -15,6 +15,7 @@ use commonware_cryptography::{
     sha256::Digest as Sha256Digest,
 };
 use commonware_macros::test_traced;
+use commonware_p2p::{Message, Receiver as P2pReceiver};
 use commonware_p2p::simulated::{Control, Link, Network, Oracle, Receiver, Sender};
 use commonware_parallel::Sequential;
 use commonware_runtime::{
@@ -27,7 +28,7 @@ use commonware_utils::{
 };
 use futures::future::join_all;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     sync::Arc,
     time::Duration,
@@ -88,6 +89,70 @@ impl Automaton for PendingApplication {
     async fn propose(&mut self, position: Height) -> oneshot::Receiver<Self::Digest> {
         let (sender, receiver) = oneshot::channel();
         assert!(self.requested.lock().insert(position, sender).is_none());
+        receiver
+    }
+
+    async fn verify(
+        &mut self,
+        _position: Height,
+        _candidate: Self::Digest,
+    ) -> oneshot::Receiver<bool> {
+        let (sender, receiver) = oneshot::channel();
+        sender.send(true).unwrap();
+        receiver
+    }
+}
+
+#[derive(Clone, Default)]
+struct ClosedApplication {
+    requested: Arc<Mutex<Vec<Height>>>,
+}
+
+#[derive(Debug)]
+struct ProcessingReceiver<R: P2pReceiver> {
+    inner: R,
+    processed: Arc<Mutex<BTreeSet<R::PublicKey>>>,
+    last_returned: Option<R::PublicKey>,
+}
+
+impl<R: P2pReceiver> ProcessingReceiver<R> {
+    fn new(inner: R, processed: Arc<Mutex<BTreeSet<R::PublicKey>>>) -> Self {
+        Self {
+            inner,
+            processed,
+            last_returned: None,
+        }
+    }
+}
+
+impl<R> P2pReceiver for ProcessingReceiver<R>
+where
+    R: P2pReceiver,
+    R::PublicKey: Ord,
+{
+    type Error = R::Error;
+    type PublicKey = R::PublicKey;
+
+    async fn recv(&mut self) -> Result<Message<Self::PublicKey>, Self::Error> {
+        if let Some(peer) = self.last_returned.take() {
+            self.processed.lock().insert(peer);
+        }
+        let result = self.inner.recv().await;
+        if let Ok((peer, _)) = &result {
+            self.last_returned = Some(peer.clone());
+        }
+        result
+    }
+}
+
+impl Automaton for ClosedApplication {
+    type Context = Height;
+    type Digest = Sha256Digest;
+
+    async fn propose(&mut self, position: Height) -> oneshot::Receiver<Self::Digest> {
+        self.requested.lock().push(position);
+        let (sender, receiver) = oneshot::channel();
+        drop(sender);
         receiver
     }
 
@@ -207,6 +272,28 @@ where
     }
 }
 
+fn certificate<S>(
+    fixture: &Fixture<S>,
+    epoch: Epoch,
+    position: Height,
+) -> Certificate<S, Sha256Digest>
+where
+    S: Scheme<Sha256Digest, PublicKey = PublicKey>,
+{
+    let item = Item {
+        position,
+        digest: digest(position),
+    };
+    let quorum = fixture.schemes[0].participants().quorum::<S::Faults>() as usize;
+    let acks: Vec<_> = fixture
+        .schemes
+        .iter()
+        .take(quorum)
+        .map(|scheme| Ack::sign(scheme, item.clone()).unwrap())
+        .collect();
+    Certificate::from_acks(&fixture.schemes[0], epoch, &acks, &Sequential).unwrap()
+}
+
 fn all_online<S, F>(fixture: F)
 where
     S: Scheme<Sha256Digest, PublicKey = PublicKey>,
@@ -283,6 +370,83 @@ where
 #[test_traced("INFO")]
 fn test_fixed_range_all_online() {
     all_online(scheme::ed25519::fixture);
+}
+
+#[test_traced("INFO")]
+fn test_delayed_digest_broadcasts_quorum_share() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 4);
+        let epoch = Epoch::new(8);
+        let position = Height::new(40);
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, true).await;
+        let delayed_application = PendingApplication::default();
+        let delayed_requests = delayed_application.requested.clone();
+        let processed = Arc::new(Mutex::new(BTreeSet::new()));
+
+        let participant = fixture.participants[0].clone();
+        let child = context.child("validator").with_attribute("index", 0);
+        let cfg = config(
+            &child,
+            fixture.schemes[0].clone(),
+            delayed_application,
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: "aggregation-delayed-digest-0".into(),
+                epoch,
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        let (engine, _mailbox) = Engine::new(child.child("engine"), cfg);
+        let (sender, receiver) = registrations.remove(&participant).unwrap();
+        let peers = [
+            fixture.participants[1].clone(),
+            fixture.participants[2].clone(),
+        ];
+        let receiver = ProcessingReceiver::new(receiver, processed.clone());
+        let mut handles = vec![engine.start((sender, receiver))];
+
+        for index in 1..3 {
+            let participant = fixture.participants[index].clone();
+            let child = context.child("validator").with_attribute("index", index);
+            let cfg = config(
+                &child,
+                fixture.schemes[index].clone(),
+                ImmediateApplication::default(),
+                RecordingReporter::default(),
+                oracle.control(participant.clone()),
+                EngineScope {
+                    partition: format!("aggregation-delayed-digest-{index}"),
+                    epoch,
+                    first: position,
+                    last: position,
+                    window: 1,
+                },
+            );
+            let (engine, _mailbox) = Engine::new(child.child("engine"), cfg);
+            handles.push(engine.start(registrations.remove(&participant).unwrap()));
+        }
+
+        while !peers.iter().all(|peer| processed.lock().contains(peer)) {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        delayed_requests
+            .lock()
+            .remove(&position)
+            .unwrap()
+            .send(digest(position))
+            .unwrap();
+
+        for result in join_all(handles).await {
+            assert_eq!(
+                result.expect("aggregation engine failed"),
+                EngineOutcome::Completed
+            );
+        }
+    });
 }
 
 fn certificate_ingress<S, F>(fixture: F)
@@ -380,6 +544,52 @@ where
 #[test_traced("INFO")]
 fn test_certificate_ingress_cancels_digest() {
     certificate_ingress(scheme::ed25519::fixture);
+}
+
+#[test_traced("INFO")]
+fn test_closed_proposal_response_is_terminal() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 4);
+        let epoch = Epoch::new(10);
+        let position = Height::new(55);
+        let participant = fixture.participants[0].clone();
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, false).await;
+        let application = ClosedApplication::default();
+        let requested = application.requested.clone();
+        let cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            application,
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: "aggregation-closed-proposal".into(),
+                epoch,
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        let (engine, mut mailbox) = Engine::new(context.child("engine"), cfg);
+        let handle = engine.start(registrations.remove(&participant).unwrap());
+
+        while requested.lock().is_empty() {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        context.sleep(Duration::from_millis(100)).await;
+        assert_eq!(requested.lock().as_slice(), &[position]);
+
+        assert_eq!(
+            mailbox.submit(certificate(&fixture, epoch, position)).await,
+            CertificateOutcome::Accepted
+        );
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Completed
+        );
+        assert_eq!(requested.lock().as_slice(), &[position]);
+    });
 }
 
 #[test_traced("INFO")]
@@ -483,6 +693,49 @@ fn test_shutdown_reports_stopped() {
     });
 }
 
+#[test_traced("INFO")]
+fn test_network_receiver_closure_reports_stopped() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 1);
+        let participant = fixture.participants[0].clone();
+        let position = Height::new(75);
+        let application = PendingApplication::default();
+        let requested = application.requested.clone();
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, false).await;
+        let cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            application,
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: "aggregation-network-closure".into(),
+                epoch: Epoch::new(12),
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        let (engine, _mailbox) = Engine::new(context.child("engine"), cfg);
+        let handle = engine.start(registrations.remove(&participant).unwrap());
+
+        while !requested.lock().contains_key(&position) {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        let _replacement = oracle
+            .control(participant)
+            .register(0, QUOTA)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Stopped
+        );
+    });
+}
+
 fn journal_identity<S, F>(fixture: F)
 where
     S: Scheme<Sha256Digest, PublicKey = PublicKey>,
@@ -573,6 +826,104 @@ where
 #[test_traced("INFO")]
 fn test_journal_replay_binds_engine_identity() {
     journal_identity(scheme::ed25519::fixture);
+}
+
+#[test_traced("INFO")]
+fn test_journal_replay_resumes_partial_mid_range() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 1);
+        let participant = fixture.participants[0].clone();
+        let epoch = Epoch::new(13);
+        let first = Height::new(120);
+        let last = Height::new(125);
+        let partition = "aggregation-partial-mid-range";
+        let replayed = [Height::new(122), Height::new(123)];
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, false).await;
+
+        let first_application = PendingApplication::default();
+        let first_requests = first_application.requested.clone();
+        let first_cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            first_application,
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: partition.into(),
+                epoch,
+                first,
+                last,
+                window: 6,
+            },
+        );
+        let (first_engine, mut first_mailbox) =
+            Engine::new(context.child("first_engine"), first_cfg);
+        let first_handle = first_engine.start(registrations.remove(&participant).unwrap());
+
+        while first_requests.lock().len() < 6 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        for position in replayed {
+            assert_eq!(
+                first_mailbox
+                    .submit(certificate(&fixture, epoch, position))
+                    .await,
+                CertificateOutcome::Accepted
+            );
+        }
+
+        let registration = oracle
+            .control(participant.clone())
+            .register(0, QUOTA)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_handle.await.expect("first aggregation engine failed"),
+            EngineOutcome::Stopped
+        );
+
+        let replay_application = ImmediateApplication::default();
+        let replay_requests = replay_application.requested.clone();
+        let replay_reporter = RecordingReporter::default();
+        let replay_activities = replay_reporter.activities.clone();
+        let replay_cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            replay_application,
+            replay_reporter,
+            oracle.control(participant),
+            EngineScope {
+                partition: partition.into(),
+                epoch,
+                first,
+                last,
+                window: 6,
+            },
+        );
+        let (replay_engine, _mailbox) = Engine::new(context.child("replay_engine"), replay_cfg);
+        assert_eq!(
+            replay_engine
+                .start(registration)
+                .await
+                .expect("replayed aggregation engine failed"),
+            EngineOutcome::Completed
+        );
+
+        let requested = replay_requests.lock();
+        assert_eq!(requested.len(), 4);
+        assert!(!requested.contains(&Height::new(122)));
+        assert!(!requested.contains(&Height::new(123)));
+        let certified: BTreeSet<_> = replay_activities
+            .lock()
+            .iter()
+            .filter_map(|activity| match activity {
+                Activity::Certified(certificate) => Some(certificate.item.position),
+                Activity::Ack(_) => None,
+            })
+            .collect();
+        assert_eq!(certified, (120..=125).map(Height::new).collect());
+    });
 }
 
 fn journal_namespace_mismatch() {

@@ -21,7 +21,7 @@ use std::hash::Hash;
 pub enum Error {
     // Proposal Errors
     /// The proposal was canceled by the application
-    #[error("Application verify error: {0}")]
+    #[error("Application propose canceled: {0}")]
     AppProposeCanceled(oneshot::error::RecvError),
 
     // Peer Errors

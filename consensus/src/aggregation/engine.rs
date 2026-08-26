@@ -251,7 +251,8 @@ where
     journal_page_cache: CacheRef,
     priority_acks: bool,
     certificate_mailbox: MailboxReceiver<CertificateMessage<S, D>>,
-    _certificate_sender: Mailbox<S, D>,
+    // Keep the mailbox open so its receive branch remains pending without external senders.
+    _mailbox_keepalive: Mailbox<S, D>,
     metrics: metrics::Metrics,
 }
 
@@ -304,7 +305,7 @@ where
             journal_page_cache: cfg.journal_page_cache,
             priority_acks: cfg.priority_acks,
             certificate_mailbox,
-            _certificate_sender: mailbox.clone(),
+            _mailbox_keepalive: mailbox.clone(),
             metrics,
         };
         (engine, mailbox)
@@ -339,6 +340,7 @@ where
         self.fill_window();
         let _ = self.metrics.frontier.try_set(self.frontier.get());
         let mut shutdown = self.context.stopped();
+        // `select!` is biased, so alternate network and maintenance priority to prevent starvation.
         let mut network_first = true;
         let outcome = loop {
             if self.complete {
@@ -374,7 +376,10 @@ where
                 Either::Left(message) => {
                     let (peer, ack) = match message {
                         Ok(value) => value,
-                        Err(err) => panic!("aggregation ack receiver failed: {err:?}"),
+                        Err(err) => {
+                            warn!(?err, "aggregation ack receiver failed");
+                            break EngineOutcome::Stopped;
+                        }
                     };
                     let mut guard = self.metrics.acks.guard(Status::Invalid);
                     let ack = match ack {
@@ -395,7 +400,7 @@ where
                         }
                         continue;
                     }
-                    if self.handle_ack(ack).await {
+                    if self.insert_ack(ack).await {
                         guard.set(Status::Success);
                     } else {
                         guard.set(Status::Failure);
@@ -498,8 +503,12 @@ where
         digest: D,
         sender: &mut WrappedSender<impl Sender<PublicKey = <S as Verifier>::PublicKey>, Ack<S, D>>,
     ) {
-        let Some(Pending::Unverified(shares)) = self.pending.remove(&position) else {
-            return;
+        let shares = match self.pending.remove(&position) {
+            Some(Pending::Unverified(shares)) => shares,
+            Some(Pending::Verified(_, _)) => {
+                unreachable!("digest completed for an already verified position")
+            }
+            None => return,
         };
         let matching = shares
             .into_iter()
@@ -510,14 +519,13 @@ where
         let Some(ack) = Ack::sign(&self.scheme, Item { position, digest }) else {
             return;
         };
+        // Persist the local ack before broadcasting it so a restart cannot sign a different digest.
         self.record(Activity::Ack(ack.clone())).await;
         self.reporter.report(Activity::Ack(ack.clone()));
         self.rebroadcast_deadlines
             .put(position, self.context.current() + self.rebroadcast_timeout);
-        self.insert_ack(ack.clone()).await;
-        if self.pending.contains_key(&position) {
-            sender.send(Recipients::All, ack, self.priority_acks);
-        }
+        sender.send(Recipients::All, ack.clone(), self.priority_acks);
+        self.insert_ack(ack).await;
     }
 
     fn validate_ack(
@@ -528,9 +536,6 @@ where
         let position = ack.item.position;
         if position < self.first
             || position > self.last
-            || self.complete
-            || position < self.frontier
-            || position.get() >= self.frontier.get().saturating_add(self.window)
             || !self.pending.contains_key(&position)
         {
             return Err(Error::AckPosition(position));
@@ -556,10 +561,6 @@ where
             return Err(Error::InvalidAckSignature);
         }
         Ok(())
-    }
-
-    async fn handle_ack(&mut self, ack: Ack<S, D>) -> bool {
-        self.insert_ack(ack).await
     }
 
     async fn insert_ack(&mut self, ack: Ack<S, D>) -> bool {
@@ -726,7 +727,7 @@ where
                     );
                     assert_eq!(
                         header.window, expected.window,
-                        "aggregation journal window mismatch"
+                        "aggregation journal window mismatch; durably archive the complete range before replacing the journal"
                     );
                 }
                 (true, _) => panic!("aggregation journal header missing"),
@@ -757,6 +758,8 @@ where
     }
 
     fn replay_activity(&mut self, activity: Activity<S, D>) {
+        // The header does not bind all namespace and threshold-verifier material, so revalidate
+        // every signed record.
         match &activity {
             Activity::Ack(ack) => {
                 let position = ack.item.position;

@@ -4,8 +4,9 @@
 //! The signing scheme is the sole source of the application namespace. The engine requests and
 //! signs every position in that range. It keeps a bounded window anchored at the lowest
 //! uncertified position. The engine returns `Completed` only after the entire range is certified;
-//! shutdown returns `Stopped`. A durable identity header prevents a journal from being replayed
-//! under different configuration.
+//! shutdown returns `Stopped`. A durable header binds the journal to its committee, epoch, range,
+//! and window. Replay revalidates each signed record because the header cannot fingerprint all
+//! scheme verification material.
 //!
 //! ## Epoch-independent signatures
 //!
