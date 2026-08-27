@@ -69,6 +69,8 @@
 mod mailbox;
 pub use mailbox::{Mailbox, Message};
 
+pub mod aggregation;
+
 mod actor;
 pub use actor::{Actor, Config, SimplexConfig};
 
