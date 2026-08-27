@@ -6,7 +6,7 @@ use commonware_codec::{
     Decode as _, DecodeExt as _, Encode, EncodeSize, Error as CodecError, Read, ReadExt as _, Write,
 };
 use commonware_consensus::{
-    Block as ConsensusBlock, CertifiableBlock, Epochable, Heightable, Reporter,
+    Block as ConsensusBlock, CertifiableBlock, Epochable, Heightable, Reporter, aggregation,
     marshal::Update,
     simplex::{self, types::Context},
     types::{Epoch, Height, Round, View},
@@ -60,12 +60,17 @@ use tracing::info;
 
 /// Threshold certificate scheme used for consensus votes and certificates.
 pub type Scheme = simplex::scheme::bls12381_threshold::vrf::Scheme<ed25519::PublicKey, MinSig>;
+/// Threshold scheme used to certify post-execution state roots.
+pub type AggregationScheme =
+    aggregation::scheme::bls12381_threshold::Scheme<ed25519::PublicKey, MinSig>;
 /// QMDB holding the application state.
 pub type Qmdb<E> = fixed::Db<mmr::Family, E, U64, U64, Sha256, TwoCap, Sequential>;
 /// Shared handle to the application QMDB.
 pub type Database<E> = Shared<Qmdb<E>>;
 /// Globally unique namespace for every message signed by this example.
 pub const NAMESPACE: &[u8] = b"_COMMONWARE_RESHARE_EXAMPLE";
+/// Namespace for post-execution state-root certificates.
+pub const AGGREGATION_NAMESPACE: &[u8] = b"_COMMONWARE_RESHARE_EXAMPLE_STATE_ROOT";
 /// Number of blocks in each epoch.
 pub const BLOCKS_PER_EPOCH: NonZeroU64 = NZU64!(64);
 /// Maximum entries accepted in each DKG participant set.
@@ -217,21 +222,32 @@ impl ReshareBlock for Block {
 }
 
 /// Certificate provider whose per-epoch schemes are registered as ceremonies complete.
-#[derive(Clone, Default)]
-pub struct DynamicProvider {
-    schemes: Arc<Mutex<HashMap<Epoch, Arc<Scheme>>>>,
+#[derive(Clone)]
+pub struct DynamicProvider<S = Scheme> {
+    schemes: Arc<Mutex<HashMap<Epoch, Arc<S>>>>,
 }
 
-impl DynamicProvider {
+impl<S> Default for DynamicProvider<S> {
+    fn default() -> Self {
+        Self {
+            schemes: Arc::default(),
+        }
+    }
+}
+
+impl<S> DynamicProvider<S> {
     /// Register the certificate scheme for `epoch`.
-    pub fn register(&self, epoch: Epoch, scheme: Scheme) {
+    pub fn register(&self, epoch: Epoch, scheme: S) {
         self.schemes.lock().insert(epoch, Arc::new(scheme));
     }
 }
 
-impl CertificateProvider for DynamicProvider {
+impl<S> CertificateProvider for DynamicProvider<S>
+where
+    S: commonware_cryptography::certificate::Scheme,
+{
     type Scope = Epoch;
-    type Scheme = Scheme;
+    type Scheme = S;
 
     fn scoped(&self, scope: Self::Scope) -> Option<Scoped<Self::Scheme>> {
         self.schemes.lock().get(&scope).cloned().map(Scoped::scheme)
@@ -246,12 +262,19 @@ impl CertificateProvider for DynamicProvider {
 #[derive(Clone)]
 pub struct Registrar {
     provider: DynamicProvider,
+    aggregation_provider: DynamicProvider<AggregationScheme>,
 }
 
 impl Registrar {
-    /// Wrap `provider` for registration by the reshare actor.
-    pub const fn new(provider: DynamicProvider) -> Self {
-        Self { provider }
+    /// Wrap the consensus and aggregation providers for registration by the reshare actor.
+    pub const fn new(
+        provider: DynamicProvider,
+        aggregation_provider: DynamicProvider<AggregationScheme>,
+    ) -> Self {
+        Self {
+            provider,
+            aggregation_provider,
+        }
     }
 }
 
@@ -264,6 +287,27 @@ impl RegistrarTrait for Registrar {
         epoch: Epoch,
         info: dkg::types::SchemeInfo<Self::Variant, Self::PublicKey>,
     ) {
+        let aggregation_scheme = match &info {
+            dkg::types::SchemeInfo::Verifier {
+                participants,
+                sharing,
+            } => AggregationScheme::verifier(
+                AGGREGATION_NAMESPACE,
+                participants.clone(),
+                sharing.clone(),
+            ),
+            dkg::types::SchemeInfo::Signer {
+                participants,
+                sharing,
+                share,
+            } => AggregationScheme::signer(
+                AGGREGATION_NAMESPACE,
+                participants.clone(),
+                sharing.clone(),
+                share.clone(),
+            )
+            .expect("registered share must match aggregation participant set"),
+        };
         let scheme = match info {
             dkg::types::SchemeInfo::Verifier {
                 participants,
@@ -277,6 +321,8 @@ impl RegistrarTrait for Registrar {
                 .expect("registered share must match participant set"),
         };
         self.provider.register(epoch, scheme);
+        self.aggregation_provider
+            .register(epoch, aggregation_scheme);
     }
 }
 

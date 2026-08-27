@@ -4,11 +4,12 @@ use crate::{
     application::App,
     config::{NetworkConfig, NodeConfig},
     types::{
-        self, BACKFILL_CHANNEL, BLOCKS_PER_EPOCH, BROADCAST_CHANNEL, Block, CERTIFICATE_CHANNEL,
-        DKG_CHANNEL, DKG_PROBE_CHANNEL, DynamicProvider, FileSecretStore, IO_BUFFER_SIZE,
-        LogReporter, MAILBOX_SIZE, MAX_MESSAGE_SIZE, MAX_PARTICIPANTS, MAX_SUPPORTED_MODE,
-        MESSAGE_RATE, NAMESPACE, PAGE_CACHE_SIZE, PAGE_SIZE, Participants, QMDB_CHANNEL,
-        RESOLVER_CHANNEL, REVEAL, Registrar, SHARING_MODE, Scheme, VOTE_CHANNEL,
+        self, AGGREGATION_NAMESPACE, AggregationScheme, BACKFILL_CHANNEL, BLOCKS_PER_EPOCH,
+        BROADCAST_CHANNEL, Block, CERTIFICATE_CHANNEL, DKG_CHANNEL, DKG_PROBE_CHANNEL,
+        DynamicProvider, FileSecretStore, IO_BUFFER_SIZE, LogReporter, MAILBOX_SIZE,
+        MAX_MESSAGE_SIZE, MAX_PARTICIPANTS, MAX_SUPPORTED_MODE, MESSAGE_RATE, NAMESPACE,
+        PAGE_CACHE_SIZE, PAGE_SIZE, Participants, QMDB_CHANNEL, RESOLVER_CHANNEL, REVEAL,
+        Registrar, SHARING_MODE, Scheme, VOTE_CHANNEL,
     },
 };
 use clap::Args;
@@ -98,10 +99,21 @@ pub async fn run(context: tokio::Context, args: Validator) {
     let p2p_handle = p2p.start();
 
     let provider = DynamicProvider::default();
+    let aggregation_provider = DynamicProvider::<AggregationScheme>::default();
     let store = FileSecretStore::load(args.node_dir.join("secrets.json"))
         .expect("failed to load secret store");
     let mut store_for_genesis = store.clone();
     if let Some(share) = store_for_genesis.get_share(Epoch::zero()).await {
+        aggregation_provider.register(
+            Epoch::zero(),
+            AggregationScheme::signer(
+                AGGREGATION_NAMESPACE,
+                genesis_info.output.players().clone(),
+                genesis_info.output.public().clone(),
+                share.clone(),
+            )
+            .expect("epoch-0 share must match aggregation scheme"),
+        );
         provider.register(
             Epoch::zero(),
             Scheme::signer(
@@ -113,6 +125,14 @@ pub async fn run(context: tokio::Context, args: Validator) {
             .expect("epoch-0 share must match genesis"),
         );
     } else {
+        aggregation_provider.register(
+            Epoch::zero(),
+            AggregationScheme::verifier(
+                AGGREGATION_NAMESPACE,
+                genesis_info.output.players().clone(),
+                genesis_info.output.public().clone(),
+            ),
+        );
         provider.register(
             Epoch::zero(),
             Scheme::verifier(
@@ -196,6 +216,14 @@ pub async fn run(context: tokio::Context, args: Validator) {
     let should_state_sync = plan.should_state_sync(args.state_sync);
     let probe_artifact = if should_state_sync {
         let artifact = probe_mailbox.subscribe().await.expect("probe stopped");
+        aggregation_provider.register(
+            artifact.info.epoch,
+            AggregationScheme::verifier(
+                AGGREGATION_NAMESPACE,
+                artifact.info.output.players().clone(),
+                artifact.info.output.public().clone(),
+            ),
+        );
         provider.register(
             artifact.info.epoch,
             Scheme::verifier(
@@ -286,7 +314,7 @@ pub async fn run(context: tokio::Context, args: Validator) {
             participants_provider: participants,
             secret_store: store,
             strategy: Sequential,
-            registrar: Registrar::new(provider.clone()),
+            registrar: Registrar::new(provider.clone(), aggregation_provider.clone()),
             marshal: marshal.clone(),
             state_sync: state_sync.clone(),
             fence,
