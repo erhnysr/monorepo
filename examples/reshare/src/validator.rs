@@ -387,6 +387,8 @@ pub async fn run(context: tokio::Context, args: Validator) {
             gate,
             state_sync,
             blocks_per_epoch: BLOCKS_PER_EPOCH,
+            peer_set_retention: 0,
+            peer_set_capacity: NZUsize!(1),
             muxer_size: 128,
             mailbox_size: MAILBOX_SIZE,
             partition_prefix: format!("{partition_prefix}-orchestrator"),

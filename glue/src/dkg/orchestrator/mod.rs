@@ -70,6 +70,7 @@ mod mailbox;
 pub use mailbox::{Mailbox, Message};
 
 pub mod aggregation;
+pub mod checkpoints;
 
 mod actor;
 pub use actor::{Actor, Config, SimplexConfig};
@@ -409,6 +410,8 @@ mod tests {
                     gate,
                     state_sync,
                     blocks_per_epoch: NZU64!(2),
+                    peer_set_retention: 0,
+                    peer_set_capacity: NZUsize!(1),
                     muxer_size: 16,
                     mailbox_size: NZUsize!(16),
                     partition_prefix,
@@ -765,6 +768,8 @@ mod tests {
                     gate,
                     state_sync: StateSyncPlan::disabled(),
                     blocks_per_epoch: NZU64!(2),
+                    peer_set_retention: 0,
+                    peer_set_capacity: NZUsize!(1),
                     muxer_size: 16,
                     mailbox_size: NZUsize!(16),
                     partition_prefix,
@@ -1035,6 +1040,8 @@ mod tests {
                     gate,
                     state_sync,
                     blocks_per_epoch: NZU64!(2),
+                    peer_set_retention: 0,
+                    peer_set_capacity: NZUsize!(1),
                     muxer_size: 16,
                     mailbox_size: NZUsize!(16),
                     partition_prefix,
