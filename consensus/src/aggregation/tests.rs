@@ -1,7 +1,7 @@
 use super::{
     CertificateOutcome, Config, Engine, EngineOutcome,
     scheme::{self, Scheme},
-    types::{Ack, Activity, Certificate, Item},
+    types::{Ack, Certificate, Item},
 };
 use crate::{
     Automaton, Reporter,
@@ -169,22 +169,22 @@ impl Automaton for ClosedApplication {
 
 #[derive(Clone)]
 struct RecordingReporter<S: commonware_cryptography::certificate::Scheme> {
-    activities: Arc<Mutex<Vec<Activity<S, Sha256Digest>>>>,
+    certificates: Arc<Mutex<Vec<Certificate<S, Sha256Digest>>>>,
 }
 
 impl<S: commonware_cryptography::certificate::Scheme> Default for RecordingReporter<S> {
     fn default() -> Self {
         Self {
-            activities: Arc::new(Mutex::new(Vec::new())),
+            certificates: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
 
 impl<S: commonware_cryptography::certificate::Scheme> Reporter for RecordingReporter<S> {
-    type Activity = Activity<S, Sha256Digest>;
+    type Activity = Certificate<S, Sha256Digest>;
 
-    fn report(&mut self, activity: Self::Activity) -> Feedback {
-        self.activities.lock().push(activity);
+    fn report(&mut self, certificate: Self::Activity) -> Feedback {
+        self.certificates.lock().push(certificate);
         Feedback::Ok
     }
 }
@@ -314,7 +314,7 @@ where
             let application = ImmediateApplication::default();
             let requested = application.requested.clone();
             let reporter = RecordingReporter::default();
-            let activities = reporter.activities.clone();
+            let certificates = reporter.certificates.clone();
             let cfg = config(
                 &child,
                 fixture.schemes[index].clone(),
@@ -332,7 +332,7 @@ where
             let (engine, _mailbox) = Engine::new(child.child("engine"), cfg);
             let network = registrations.remove(participant).unwrap();
             handles.push(engine.start(network));
-            observations.push((requested, activities));
+            observations.push((requested, certificates));
         }
 
         for result in join_all(handles).await {
@@ -341,7 +341,7 @@ where
                 EngineOutcome::Completed
             );
         }
-        for (requested, activities) in observations {
+        for (requested, certificates) in observations {
             let requested = requested.lock();
             assert_eq!(requested.len(), 16);
             assert!(
@@ -350,15 +350,10 @@ where
                     .all(|position| *position >= first && *position <= last)
             );
 
-            let activities = activities.lock();
-            let certificates: BTreeMap<_, _> = activities
+            let certificates = certificates.lock();
+            let certificates: BTreeMap<_, _> = certificates
                 .iter()
-                .filter_map(|activity| match activity {
-                    Activity::Certified(certificate) => {
-                        Some((certificate.item.position, certificate))
-                    }
-                    Activity::Ack(_) => None,
-                })
+                .map(|certificate| (certificate.item.position, certificate))
                 .collect();
             assert_eq!(certificates.len(), 16);
             assert_eq!(certificates.first_key_value().unwrap().0, &first);
@@ -464,7 +459,7 @@ where
         let application = PendingApplication::default();
         let requested = application.requested.clone();
         let reporter = RecordingReporter::default();
-        let activities = reporter.activities.clone();
+        let certificates = reporter.certificates.clone();
         let cfg = config(
             &context,
             fixture.schemes[0].clone(),
@@ -525,19 +520,7 @@ where
 
         let pending_sender = requested.lock().remove(&position).unwrap();
         assert!(pending_sender.send(digest(position)).is_err());
-        let activities = activities.lock();
-        assert_eq!(
-            activities
-                .iter()
-                .filter(|activity| matches!(activity, Activity::Certified(_)))
-                .count(),
-            1
-        );
-        assert!(
-            !activities
-                .iter()
-                .any(|activity| matches!(activity, Activity::Ack(_)))
-        );
+        assert_eq!(certificates.lock().len(), 1);
     });
 }
 
@@ -736,6 +719,96 @@ fn test_network_receiver_closure_reports_stopped() {
     });
 }
 
+#[test_traced("INFO")]
+fn test_restart_reproposes_uncertified_position() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 4);
+        let participant = fixture.participants[0].clone();
+        let observer = fixture.participants[1].clone();
+        let epoch = Epoch::new(13);
+        let position = Height::new(76);
+        let partition = "aggregation-repropose";
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, true).await;
+        let (_, mut observer_receiver) = registrations.remove(&observer).unwrap();
+
+        let first_application = PendingApplication::default();
+        let first_requests = first_application.requested.clone();
+        let first_cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            first_application,
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: partition.into(),
+                epoch,
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        let (first_engine, _mailbox) = Engine::new(context.child("first_engine"), first_cfg);
+        let first_handle = first_engine.start(registrations.remove(&participant).unwrap());
+
+        while !first_requests.lock().contains_key(&position) {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        first_requests
+            .lock()
+            .remove(&position)
+            .unwrap()
+            .send(digest(position))
+            .unwrap();
+        observer_receiver.recv().await.unwrap();
+
+        let restart_registration = oracle
+            .control(participant.clone())
+            .register(0, QUOTA)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_handle.await.expect("first aggregation engine failed"),
+            EngineOutcome::Stopped
+        );
+
+        let restart_application = PendingApplication::default();
+        let restart_requests = restart_application.requested.clone();
+        let restart_cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            restart_application,
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: partition.into(),
+                epoch,
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        let (restart_engine, _mailbox) =
+            Engine::new(context.child("restart_engine"), restart_cfg);
+        let restart_handle = restart_engine.start(restart_registration);
+
+        while !restart_requests.lock().contains_key(&position) {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        let _replacement = oracle
+            .control(participant)
+            .register(0, QUOTA)
+            .await
+            .unwrap();
+        assert_eq!(
+            restart_handle
+                .await
+                .expect("restarted aggregation engine failed"),
+            EngineOutcome::Stopped
+        );
+    });
+}
+
 fn journal_identity<S, F>(fixture: F)
 where
     S: Scheme<Sha256Digest, PublicKey = PublicKey>,
@@ -751,7 +824,7 @@ where
         let (first_oracle, mut first_registrations) =
             simulation(context.child("first_simulation"), &fixture, false).await;
         let first_reporter = RecordingReporter::default();
-        let first_activities = first_reporter.activities.clone();
+        let first_certificates = first_reporter.certificates.clone();
         let first_cfg = config(
             &context,
             fixture.schemes[0].clone(),
@@ -775,11 +848,7 @@ where
             EngineOutcome::Completed
         );
         assert_eq!(
-            first_activities
-                .lock()
-                .iter()
-                .filter(|activity| matches!(activity, Activity::Certified(_)))
-                .count(),
+            first_certificates.lock().len(),
             1
         );
 
@@ -788,7 +857,7 @@ where
         let replay_application = ImmediateApplication::default();
         let replay_requests = replay_application.requested.clone();
         let replay_reporter = RecordingReporter::default();
-        let replay_activities = replay_reporter.activities.clone();
+        let replay_certificates = replay_reporter.certificates.clone();
         let replay_cfg = config(
             &context,
             fixture.schemes[0].clone(),
@@ -813,11 +882,7 @@ where
         );
         assert!(replay_requests.lock().is_empty());
         assert_eq!(
-            replay_activities
-                .lock()
-                .iter()
-                .filter(|activity| matches!(activity, Activity::Certified(_)))
-                .count(),
+            replay_certificates.lock().len(),
             1
         );
     });
@@ -886,7 +951,7 @@ fn test_journal_replay_resumes_partial_mid_range() {
         let replay_application = ImmediateApplication::default();
         let replay_requests = replay_application.requested.clone();
         let replay_reporter = RecordingReporter::default();
-        let replay_activities = replay_reporter.activities.clone();
+        let replay_certificates = replay_reporter.certificates.clone();
         let replay_cfg = config(
             &context,
             fixture.schemes[0].clone(),
@@ -914,13 +979,10 @@ fn test_journal_replay_resumes_partial_mid_range() {
         assert_eq!(requested.len(), 4);
         assert!(!requested.contains(&Height::new(122)));
         assert!(!requested.contains(&Height::new(123)));
-        let certified: BTreeSet<_> = replay_activities
+        let certified: BTreeSet<_> = replay_certificates
             .lock()
             .iter()
-            .filter_map(|activity| match activity {
-                Activity::Certified(certificate) => Some(certificate.item.position),
-                Activity::Ack(_) => None,
-            })
+            .map(|certificate| certificate.item.position)
             .collect();
         assert_eq!(certified, (120..=125).map(Height::new).collect());
     });
@@ -990,7 +1052,7 @@ fn journal_namespace_mismatch() {
 }
 
 #[test_traced("INFO")]
-#[should_panic(expected = "journal ack signature mismatch")]
+#[should_panic(expected = "journal certificate signature mismatch")]
 fn test_journal_rejects_signing_namespace_mismatch() {
     journal_namespace_mismatch();
 }

@@ -1,4 +1,4 @@
-use crate::aggregation::types::{Activity, Certificate};
+use crate::aggregation::types::Certificate;
 use commonware_actor::{
     Feedback,
     mailbox::{self, Policy, Receiver, Sender},
@@ -13,7 +13,7 @@ use std::{
 };
 
 enum Message<S: Scheme, D: Digest> {
-    Activity(Activity<S, D>),
+    Certificate(Certificate<S, D>),
     Get(oneshot::Sender<BTreeMap<crate::types::Height, Certificate<S, D>>>),
 }
 
@@ -55,11 +55,10 @@ impl<R: CryptoRng + Metrics, S: Scheme, D: Digest> Reporter<R, S, D> {
     async fn run(mut self) {
         while let Some(message) = self.mailbox.recv().await {
             match message {
-                Message::Activity(Activity::Certified(certificate)) => {
+                Message::Certificate(certificate) => {
                     self.certificates
                         .insert(certificate.item.position, certificate);
                 }
-                Message::Activity(Activity::Ack(_)) => {}
                 Message::Get(sender) => {
                     sender.send(self.certificates.clone()).unwrap();
                 }
@@ -74,9 +73,9 @@ pub struct Mailbox<S: Scheme, D: Digest> {
 }
 
 impl<S: Scheme, D: Digest> crate::Reporter for Mailbox<S, D> {
-    type Activity = Activity<S, D>;
-    fn report(&mut self, activity: Self::Activity) -> Feedback {
-        self.sender.enqueue(Message::Activity(activity))
+    type Activity = Certificate<S, D>;
+    fn report(&mut self, certificate: Self::Activity) -> Feedback {
+        self.sender.enqueue(Message::Certificate(certificate))
     }
 }
 

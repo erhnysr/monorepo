@@ -2,7 +2,7 @@
 
 use super::{
     Config, metrics, scheme,
-    types::{Ack, Activity, Certificate, Error, Item},
+    types::{Ack, Certificate, Error, Item},
 };
 use crate::{
     Automaton, Reporter,
@@ -44,7 +44,7 @@ use std::{
 };
 use tracing::{debug, info, warn};
 
-const JOURNAL_VERSION: u8 = 1;
+const JOURNAL_VERSION: u8 = 2;
 const JOURNAL_COMMITTEE_DOMAIN: &[u8] = b"_COMMONWARE_CONSENSUS_AGGREGATION_JOURNAL_COMMITTEE_V1";
 type IdentityDigest = <Sha256 as Hasher>::Digest;
 
@@ -99,7 +99,7 @@ impl EncodeSize for Header {
 #[derive(Clone, Debug)]
 enum Record<S: commonware_cryptography::certificate::Scheme, D: Digest> {
     Header(Header),
-    Activity(Activity<S, D>),
+    Certificate(Certificate<S, D>),
 }
 
 impl<S: commonware_cryptography::certificate::Scheme, D: Digest> Write for Record<S, D> {
@@ -109,9 +109,9 @@ impl<S: commonware_cryptography::certificate::Scheme, D: Digest> Write for Recor
                 0u8.write(writer);
                 header.write(writer);
             }
-            Self::Activity(activity) => {
+            Self::Certificate(certificate) => {
                 1u8.write(writer);
-                activity.write(writer);
+                certificate.write(writer);
             }
         }
     }
@@ -123,7 +123,7 @@ impl<S: commonware_cryptography::certificate::Scheme, D: Digest> Read for Record
     fn read_cfg(reader: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         match u8::read(reader)? {
             0 => Ok(Self::Header(Header::read(reader)?)),
-            1 => Ok(Self::Activity(Activity::read_cfg(reader, cfg)?)),
+            1 => Ok(Self::Certificate(Certificate::read_cfg(reader, cfg)?)),
             _ => Err(CodecError::Invalid(
                 "consensus::aggregation::Record",
                 "invalid type",
@@ -136,7 +136,7 @@ impl<S: commonware_cryptography::certificate::Scheme, D: Digest> EncodeSize for 
     fn encode_size(&self) -> usize {
         1 + match self {
             Self::Header(v) => v.encode_size(),
-            Self::Activity(v) => v.encode_size(),
+            Self::Certificate(v) => v.encode_size(),
         }
     }
 }
@@ -220,7 +220,7 @@ where
     S: scheme::Scheme<D>,
     D: Digest,
     A: Automaton<Context = Height, Digest = D>,
-    Z: Reporter<Activity = Activity<S, D>>,
+    Z: Reporter<Activity = Certificate<S, D>>,
     B: Blocker<PublicKey = <S as Verifier>::PublicKey>,
     T: Strategy,
 {
@@ -262,7 +262,7 @@ where
     S: scheme::Scheme<D>,
     D: Digest,
     A: Automaton<Context = Height, Digest = D>,
-    Z: Reporter<Activity = Activity<S, D>>,
+    Z: Reporter<Activity = Certificate<S, D>>,
     B: Blocker<PublicKey = <S as Verifier>::PublicKey>,
     T: Strategy,
 {
@@ -519,9 +519,6 @@ where
         let Some(ack) = Ack::sign(&self.scheme, Item { position, digest }) else {
             return;
         };
-        // Persist the local ack before broadcasting it so a restart cannot sign a different digest.
-        self.record(Activity::Ack(ack.clone())).await;
-        self.reporter.report(Activity::Ack(ack.clone()));
         self.rebroadcast_deadlines
             .put(position, self.context.current() + self.rebroadcast_timeout);
         sender.send(Recipients::All, ack.clone(), self.priority_acks);
@@ -603,9 +600,8 @@ where
             );
             return;
         }
-        self.record(Activity::Certified(certificate.clone())).await;
-        self.reporter
-            .report(Activity::Certified(certificate.clone()));
+        self.record_certificate(certificate.clone()).await;
+        self.reporter.report(certificate.clone());
         self.pending.remove(&position);
         self.digest_aborters.remove(&position);
         self.rebroadcast_deadlines.remove(&position);
@@ -732,7 +728,9 @@ where
                 }
                 (true, _) => panic!("aggregation journal header missing"),
                 (false, Record::Header(_)) => panic!("duplicate aggregation journal header"),
-                (false, Record::Activity(activity)) => self.replay_activity(activity),
+                (false, Record::Certificate(certificate)) => {
+                    self.replay_certificate(certificate)
+                }
             }
             first_record = false;
         }
@@ -748,101 +746,55 @@ where
             assert!(!first_record, "aggregation journal header missing");
             self.journal = Some(journal);
         }
-        for (&position, pending) in &self.pending {
-            if matches!(pending, Pending::Verified(_, _)) {
-                self.rebroadcast_deadlines
-                    .put(position, self.context.current());
-            }
-        }
         info!(epoch = %self.epoch, first = %self.first, last = %self.last, frontier = %self.frontier, "replayed aggregation journal");
     }
 
-    fn replay_activity(&mut self, activity: Activity<S, D>) {
+    fn replay_certificate(&mut self, certificate: Certificate<S, D>) {
         // The header does not bind all namespace and threshold-verifier material, so revalidate
-        // every signed record.
-        match &activity {
-            Activity::Ack(ack) => {
-                let position = ack.item.position;
-                assert!(
-                    position >= self.first && position <= self.last,
-                    "journal ack outside range"
-                );
+        // every certificate.
+        let position = certificate.item.position;
+        assert_eq!(
+            certificate.epoch, self.epoch,
+            "journal certificate epoch mismatch"
+        );
+        assert!(
+            position >= self.first && position <= self.last,
+            "journal certificate outside range"
+        );
+        assert!(
+            certificate.verify_for(
+                self.context.as_mut(),
+                &self.scheme,
+                self.epoch,
+                self.first,
+                self.last,
+                &self.strategy,
+            ),
+            "journal certificate signature mismatch"
+        );
+        if position >= self.frontier {
+            if let Some(existing) = self.confirmed.insert(position, certificate.clone()) {
                 assert_eq!(
-                    Some(ack.attestation.signer),
-                    self.scheme.me(),
-                    "journal ack signer mismatch"
+                    existing.item.digest, certificate.item.digest,
+                    "conflicting journal certificates"
                 );
-                assert!(
-                    ack.verify(self.context.as_mut(), &self.scheme, &self.strategy),
-                    "journal ack signature mismatch"
-                );
-                if position >= self.frontier {
-                    let entry = self
-                        .pending
-                        .entry(position)
-                        .or_insert_with(|| Pending::Verified(ack.item.digest, BTreeMap::new()));
-                    match entry {
-                        Pending::Verified(digest, shares) => {
-                            assert_eq!(*digest, ack.item.digest, "conflicting local journal acks");
-                            shares.insert(ack.attestation.signer, ack.clone());
-                        }
-                        Pending::Unverified(_) => unreachable!(),
-                    }
-                }
             }
-            Activity::Certified(certificate) => {
-                let position = certificate.item.position;
-                assert_eq!(
-                    certificate.epoch, self.epoch,
-                    "journal certificate epoch mismatch"
-                );
-                assert!(
-                    position >= self.first && position <= self.last,
-                    "journal certificate outside range"
-                );
-                assert!(
-                    certificate.verify_for(
-                        self.context.as_mut(),
-                        &self.scheme,
-                        self.epoch,
-                        self.first,
-                        self.last,
-                        &self.strategy,
-                    ),
-                    "journal certificate signature mismatch"
-                );
-                if position >= self.frontier {
-                    if let Some(Pending::Verified(digest, _)) = self.pending.get(&position) {
-                        assert_eq!(*digest, certificate.item.digest, "journal digest conflict");
-                    }
-                    if let Some(existing) = self.confirmed.insert(position, certificate.clone()) {
-                        assert_eq!(
-                            existing.item.digest, certificate.item.digest,
-                            "conflicting journal certificates"
-                        );
-                    }
-                    self.pending.remove(&position);
-                    while self.confirmed.remove(&self.frontier).is_some() {
-                        if self.frontier == self.last {
-                            self.complete = true;
-                            let _ = self.metrics.complete.try_set(1);
-                            break;
-                        }
-                        self.frontier = self.frontier.next();
-                    }
+            while self.confirmed.remove(&self.frontier).is_some() {
+                if self.frontier == self.last {
+                    self.complete = true;
+                    let _ = self.metrics.complete.try_set(1);
+                    break;
                 }
+                self.frontier = self.frontier.next();
             }
         }
-        self.reporter.report(activity);
+        self.reporter.report(certificate);
     }
 
-    async fn record(&mut self, activity: Activity<S, D>) {
-        let position = match &activity {
-            Activity::Ack(v) => v.item.position,
-            Activity::Certified(v) => v.item.position,
-        };
+    async fn record_certificate(&mut self, certificate: Certificate<S, D>) {
+        let position = certificate.item.position;
         let section = position.get() / self.journal_heights_per_section.get();
-        let record = Record::Activity(activity);
+        let record = Record::Certificate(certificate);
         rebind(&mut self.journal, |journal| {
             journal.append(section, &record)
         })

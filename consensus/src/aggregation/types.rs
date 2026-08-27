@@ -333,82 +333,13 @@ where
     }
 }
 
-/// Used as [Reporter::Activity](crate::Reporter::Activity) to report activities that occur during
-/// aggregation. Also used to journal events that are needed to initialize the aggregation engine
-/// when the node restarts.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Activity<S: Scheme, D: Digest> {
-    /// Received an ack from a participant.
-    Ack(Ack<S, D>),
-
-    /// Certified an [Item].
-    Certified(Certificate<S, D>),
-}
-
-impl<S: Scheme, D: Digest> Write for Activity<S, D> {
-    fn write(&self, writer: &mut impl BufMut) {
-        match self {
-            Self::Ack(ack) => {
-                0u8.write(writer);
-                ack.write(writer);
-            }
-            Self::Certified(certificate) => {
-                1u8.write(writer);
-                certificate.write(writer);
-            }
-        }
-    }
-}
-
-impl<S: Scheme, D: Digest> Read for Activity<S, D> {
-    type Cfg = <S::Certificate as Read>::Cfg;
-
-    fn read_cfg(reader: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        match u8::read(reader)? {
-            0 => Ok(Self::Ack(Ack::read(reader)?)),
-            1 => Ok(Self::Certified(Certificate::read_cfg(reader, cfg)?)),
-            _ => Err(CodecError::Invalid(
-                "consensus::aggregation::Activity",
-                "Invalid type",
-            )),
-        }
-    }
-}
-
-impl<S: Scheme, D: Digest> EncodeSize for Activity<S, D> {
-    fn encode_size(&self) -> usize {
-        1 + match self {
-            Self::Ack(ack) => ack.encode_size(),
-            Self::Certified(certificate) => certificate.encode_size(),
-        }
-    }
-}
-
-#[cfg(feature = "arbitrary")]
-impl<S: Scheme, D: Digest> arbitrary::Arbitrary<'_> for Activity<S, D>
-where
-    D: for<'a> arbitrary::Arbitrary<'a>,
-    Ack<S, D>: for<'a> arbitrary::Arbitrary<'a>,
-    Certificate<S, D>: for<'a> arbitrary::Arbitrary<'a>,
-{
-    fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let choice = u.int_in_range(0..=1)?;
-        match choice {
-            0 => Ok(Self::Ack(u.arbitrary::<Ack<S, D>>()?)),
-            1 => Ok(Self::Certified(u.arbitrary::<Certificate<S, D>>()?)),
-            _ => unreachable!(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::aggregation::scheme::{
         Scheme, bls12381_multisig, bls12381_threshold, ed25519, secp256r1,
     };
-    use bytes::BytesMut;
-    use commonware_codec::{Decode, DecodeExt, Encode};
+    use commonware_codec::{DecodeExt, Encode};
     use commonware_cryptography::{
         Hasher, Sha256,
         bls12381::primitives::variant::{MinPk, MinSig},
@@ -447,7 +378,6 @@ mod tests {
 
         // Test Ack creation and codec
         let ack = Ack::sign(&schemes[0], item.clone()).unwrap();
-        let cfg = schemes[0].certificate_codec_config();
         let encoded_ack = ack.encode();
         let restored_ack: Ack<S, Sha256Digest> = Ack::decode(encoded_ack).unwrap();
 
@@ -455,18 +385,6 @@ mod tests {
         assert_eq!(restored_ack.item, item);
         assert!(restored_ack.verify(&mut rng, &schemes[0], &Sequential));
 
-        // Test Activity codec - Ack variant
-        let activity_ack = Activity::Ack(ack);
-        let encoded_activity = activity_ack.encode();
-        let restored_activity_ack: Activity<S, Sha256Digest> =
-            Activity::decode_cfg(encoded_activity, &cfg).unwrap();
-        if let Activity::Ack(restored) = restored_activity_ack {
-            assert_eq!(restored.item, item);
-        } else {
-            panic!("Expected Activity::Ack");
-        }
-
-        // Test Activity codec - Certified variant
         // Collect enough acks for a certificate
         let acks: Vec<_> = schemes
             .iter()
@@ -496,24 +414,6 @@ mod tests {
             &Sequential,
         ));
 
-        let activity_certified = Activity::Certified(certificate.clone());
-        let encoded_certified = activity_certified.encode();
-        let restored_activity_certified: Activity<S, Sha256Digest> =
-            Activity::decode_cfg(encoded_certified, &cfg).unwrap();
-        if let Activity::Certified(restored) = restored_activity_certified {
-            assert_eq!(restored.item, item);
-            assert_eq!(restored.epoch, Epoch::new(1));
-            assert!(restored.verify_for(
-                &mut rng,
-                &schemes[0],
-                Epoch::new(1),
-                Height::new(100),
-                Height::new(100),
-                &Sequential,
-            ));
-        } else {
-            panic!("Expected Activity::Certified");
-        }
     }
 
     #[test]
@@ -524,36 +424,6 @@ mod tests {
         codec(bls12381_multisig::fixture::<MinSig, _>);
         codec(bls12381_threshold::fixture::<MinPk, _>);
         codec(bls12381_threshold::fixture::<MinSig, _>);
-    }
-
-    fn activity_invalid_enum<S, F>(fixture: F)
-    where
-        S: Scheme<Sha256Digest>,
-        F: FnOnce(&mut TestRng, &[u8], u32) -> Fixture<S>,
-    {
-        let fixture = fixture(&mut test_rng(), NAMESPACE, 4);
-        let mut buf = BytesMut::new();
-        2u8.write(&mut buf); // Invalid discriminant
-
-        let cfg = fixture.schemes[0].certificate_codec_config();
-        let result = Activity::<S, Sha256Digest>::read_cfg(&mut &buf[..], &cfg);
-        assert!(matches!(
-            result,
-            Err(CodecError::Invalid(
-                "consensus::aggregation::Activity",
-                "Invalid type"
-            ))
-        ));
-    }
-
-    #[test]
-    fn test_activity_invalid_enum() {
-        activity_invalid_enum(ed25519::fixture);
-        activity_invalid_enum(secp256r1::fixture);
-        activity_invalid_enum(bls12381_multisig::fixture::<MinPk, _>);
-        activity_invalid_enum(bls12381_multisig::fixture::<MinSig, _>);
-        activity_invalid_enum(bls12381_threshold::fixture::<MinPk, _>);
-        activity_invalid_enum(bls12381_threshold::fixture::<MinSig, _>);
     }
 
     #[cfg(feature = "arbitrary")]
@@ -569,7 +439,6 @@ mod tests {
             CodecConformance<Item<Sha256Digest>>,
             CodecConformance<Ack<Scheme, Sha256Digest>>,
             CodecConformance<Certificate<Scheme, Sha256Digest>>,
-            CodecConformance<Activity<Scheme, Sha256Digest>>,
         }
     }
 }

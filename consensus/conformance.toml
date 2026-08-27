@@ -2,10 +2,6 @@
 n_cases = 65536
 hash = "403e866144f11c0af693b1009b1e525f0352603baca0fe5dad529f1c1b8f900a"
 
-["commonware_consensus::aggregation::types::tests::conformance::CodecConformance<Activity<Scheme,Sha256Digest>>"]
-n_cases = 65536
-hash = "8023054f3897d882d06a0d65e2f07115231588a349c91393b7955733c8902bbb"
-
 ["commonware_consensus::aggregation::types::tests::conformance::CodecConformance<Certificate<Scheme,Sha256Digest>>"]
 n_cases = 65536
 hash = "1cc057914de5688dec8228c0ba788b74f00f2e6d11c5371eeedf0c025b330a73"

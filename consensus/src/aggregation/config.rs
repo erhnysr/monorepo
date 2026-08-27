@@ -1,4 +1,4 @@
-use super::{scheme, types::Activity};
+use super::{scheme, types::Certificate};
 use crate::{
     Automaton, Reporter,
     types::{Epoch, Height},
@@ -15,7 +15,7 @@ pub struct Config<
     S: scheme::Scheme<D>,
     D: Digest,
     A: Automaton<Context = Height, Digest = D>,
-    Z: Reporter<Activity = Activity<S, D>>,
+    Z: Reporter<Activity = Certificate<S, D>>,
     B: Blocker<PublicKey = <S as Verifier>::PublicKey>,
     T: Strategy,
 > {
@@ -27,13 +27,13 @@ pub struct Config<
     pub last: Height,
     /// Fixed signing scheme for `epoch`.
     pub scheme: S,
-    /// Proposes digests.
+    /// Provides the canonical digest for each position.
     ///
-    /// Closing a proposal response declines the position for this engine instance. The engine will
-    /// not sign that position. The position can still complete from a learned certificate or after
-    /// restart.
+    /// Every successful response for a position must return the same digest across clones and
+    /// restarts. Closing a response declines the position for this engine instance. The position
+    /// can still complete from a learned certificate or after restart.
     pub automaton: A,
-    /// Receives activities after the engine syncs them to its journal.
+    /// Receives certificates after the engine syncs them to its journal.
     ///
     /// Reporter feedback does not confirm archival durability.
     pub reporter: Z,
