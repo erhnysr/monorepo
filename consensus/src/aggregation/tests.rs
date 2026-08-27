@@ -863,6 +863,46 @@ fn test_shutdown_reports_stopped() {
 }
 
 #[test_traced("INFO")]
+fn test_graceful_stop_reports_stopped() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 1);
+        let participant = fixture.participants[0].clone();
+        let position = Height::new(71);
+        let application = PendingApplication::default();
+        let requested = application.requested.clone();
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, false).await;
+        let cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            application,
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: "aggregation-graceful-stop".into(),
+                epoch: Epoch::new(11),
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        let (engine, _mailbox) = Engine::new(context.child("engine"), cfg);
+        let (handle, stopper) =
+            engine.start_stoppable(registrations.remove(&participant).unwrap());
+
+        while !requested.lock().contains_key(&position) {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        stopper.stop();
+
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Stopped
+        );
+    });
+}
+
+#[test_traced("INFO")]
 fn test_network_receiver_closure_reports_stopped() {
     deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
         let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 1);

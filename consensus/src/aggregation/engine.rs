@@ -36,7 +36,7 @@ use commonware_utils::{
     non_empty,
     ordered::Quorum,
 };
-use futures::future::{self, Either};
+use futures::{Future, FutureExt as _, future::{self, Either}};
 use rand_core::CryptoRng;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -200,6 +200,19 @@ pub struct Mailbox<S: commonware_cryptography::certificate::Scheme, D: Digest> {
     sender: MailboxSender<CertificateMessage<S, D>>,
 }
 
+/// Gracefully stops one aggregation engine.
+///
+/// Dropping this handle also requests shutdown. The engine finishes its current operation,
+/// cancels recovery, syncs its journal, and returns [`EngineOutcome::Stopped`].
+pub struct Stopper(oneshot::Sender<()>);
+
+impl Stopper {
+    /// Requests graceful shutdown.
+    pub fn stop(self) {
+        let _ = self.0.send(());
+    }
+}
+
 impl<S: commonware_cryptography::certificate::Scheme, D: Digest> Mailbox<S, D> {
     /// Validates and applies a recovered certificate.
     pub async fn submit(&mut self, certificate: Certificate<S, D>) -> CertificateOutcome {
@@ -337,17 +350,50 @@ where
             impl Receiver<PublicKey = <S as Verifier>::PublicKey>,
         ),
     ) -> Handle<EngineOutcome> {
-        let mut this = self;
-        spawn_cell!(this.context, this.run(network))
+        self.start_inner(network, future::pending())
     }
 
-    async fn run(
+    /// Starts an engine that can be stopped independently from its runtime context.
+    pub fn start_stoppable(
+        self,
+        network: (
+            impl Sender<PublicKey = <S as Verifier>::PublicKey>,
+            impl Receiver<PublicKey = <S as Verifier>::PublicKey>,
+        ),
+    ) -> (Handle<EngineOutcome>, Stopper) {
+        let (stopper, stopped) = oneshot::channel();
+        (
+            self.start_inner(network, stopped.map(|_| ())),
+            Stopper(stopper),
+        )
+    }
+
+    fn start_inner<F>(
+        self,
+        network: (
+            impl Sender<PublicKey = <S as Verifier>::PublicKey>,
+            impl Receiver<PublicKey = <S as Verifier>::PublicKey>,
+        ),
+        stopping: F,
+    ) -> Handle<EngineOutcome>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut this = self;
+        spawn_cell!(this.context, this.run(network, stopping))
+    }
+
+    async fn run<F>(
         mut self,
         network: (
             impl Sender<PublicKey = <S as Verifier>::PublicKey>,
             impl Receiver<PublicKey = <S as Verifier>::PublicKey>,
         ),
-    ) -> EngineOutcome {
+        stopping: F,
+    ) -> EngineOutcome
+    where
+        F: Future<Output = ()> + Send,
+    {
         let (mut sender, mut receiver) = wrap(
             (),
             self.context.network_buffer_pool().clone(),
@@ -358,6 +404,7 @@ where
         self.fill_window(restarted);
         let _ = self.metrics.frontier.try_set(self.frontier.get());
         let mut shutdown = self.context.stopped();
+        futures::pin_mut!(stopping);
         // `select!` is biased, so alternate network and maintenance priority to prevent starvation.
         let mut network_first = true;
         let outcome = loop {
@@ -378,12 +425,14 @@ where
             let event = if network_first {
                 select! {
                     _ = &mut shutdown => { debug!("shutdown"); break EngineOutcome::Stopped; },
+                    _ = &mut stopping => { debug!("stopping"); break EngineOutcome::Stopped; },
                     message = receiver.recv() => Either::Left(message),
                     maintenance = maintenance => Either::Right(maintenance),
                 }
             } else {
                 select! {
                     _ = &mut shutdown => { debug!("shutdown"); break EngineOutcome::Stopped; },
+                    _ = &mut stopping => { debug!("stopping"); break EngineOutcome::Stopped; },
                     maintenance = maintenance => Either::Right(maintenance),
                     message = receiver.recv() => Either::Left(message),
                 }
