@@ -461,4 +461,29 @@ mod tests {
             assert!(conflict_waiter.await.is_err());
         });
     }
+
+    #[test]
+    fn pending_requests_are_bounded() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut cfg = config(&context);
+            cfg.max_pending_requests = NZUsize!(1);
+            let (actor, mut handler) =
+                Actor::<_, TestBlock, Exact>::init(context.child("actor"), cfg)
+                    .await
+                    .unwrap();
+
+            let first = handler.propose(Height::new(1)).await;
+            let second = handler.propose(Height::new(2)).await;
+            let third = handler.propose(Height::new(3)).await;
+            let handle = actor.start();
+            let (acknowledgement, acknowledged) = Exact::handle();
+            let _ = handler.report(Update::Block(Arc::new(block(1, 1)), acknowledgement));
+
+            assert!(first.await.is_ok());
+            assert!(second.await.is_err());
+            assert!(third.await.is_err());
+            acknowledged.await.unwrap();
+            handle.abort();
+        });
+    }
 }
