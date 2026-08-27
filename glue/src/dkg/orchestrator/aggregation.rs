@@ -13,7 +13,10 @@
 //! does not guess how a private journal is named or stored.
 
 use bytes::{Buf, BufMut, Bytes};
-use commonware_actor::mailbox::{self, Overflow, Policy, Sender};
+use commonware_actor::{
+    Feedback,
+    mailbox::{self, Overflow, Policy, Sender},
+};
 use commonware_codec::{Decode, Encode, EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
 use commonware_consensus::{
     aggregation::{
@@ -142,6 +145,17 @@ pub enum Error {
     /// Retirement metadata failure.
     #[error("metadata error: {0}")]
     Metadata(#[from] commonware_storage::metadata::Error),
+}
+
+/// Failure to submit or complete a direct history request.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum RequestError {
+    /// The bounded history mailbox could not accept the request.
+    #[error("aggregation history is backpressured")]
+    Backpressured,
+    /// The history actor closed before completing the request.
+    #[error("aggregation history is closed")]
+    Closed,
 }
 
 /// Persistent storage and ingress configuration.
@@ -360,54 +374,72 @@ impl Handler {
     /// Archives a locally recovered certificate.
     ///
     /// `Stored` and `Duplicate` are returned only after an archive sync succeeds.
-    pub fn archive(&mut self, key: RecoveryKey, value: Bytes) -> oneshot::Receiver<ArchiveStatus> {
+    pub async fn archive(
+        &mut self,
+        key: RecoveryKey,
+        value: Bytes,
+    ) -> Result<ArchiveStatus, RequestError> {
         let (response, receiver) = oneshot::channel();
-        let _ = self.sender.enqueue(Message::Archive { key, value, response });
-        receiver
+        let feedback = self.sender.enqueue(Message::Archive { key, value, response });
+        receive(feedback, receiver).await
     }
 
     /// Retires one exact authenticated epoch range.
     ///
     /// The returned cleanup intent is the journal-cleanup gate.
-    pub fn retire(&mut self, retirement: Retirement) -> oneshot::Receiver<Option<Cleanup>> {
+    pub async fn retire(
+        &mut self,
+        retirement: Retirement,
+    ) -> Result<Option<Cleanup>, RequestError> {
         let (response, receiver) = oneshot::channel();
-        let _ = self.sender.enqueue(Message::Retire { retirement, response });
-        receiver
+        let feedback = self.sender.enqueue(Message::Retire { retirement, response });
+        receive(feedback, receiver).await
     }
 
     /// Reads the persisted or authenticated initial discovery floor.
-    pub fn oldest_unretired(
+    pub async fn oldest_unretired(
         &mut self,
         namespace: RecoveryNamespace,
-    ) -> oneshot::Receiver<Option<Epoch>> {
+    ) -> Result<Option<Epoch>, RequestError> {
         let (response, receiver) = oneshot::channel();
-        let _ = self.sender.enqueue(Message::Oldest { namespace, response });
-        receiver
+        let feedback = self.sender.enqueue(Message::Oldest { namespace, response });
+        receive(feedback, receiver).await
     }
 
     /// Returns whether the exact retirement marker is durable.
-    pub fn retired(&mut self, retirement: Retirement) -> oneshot::Receiver<bool> {
+    pub async fn retired(&mut self, retirement: Retirement) -> Result<bool, RequestError> {
         let (response, receiver) = oneshot::channel();
-        let _ = self.sender.enqueue(Message::Retired {
+        let feedback = self.sender.enqueue(Message::Retired {
             retirement,
             response,
         });
-        receiver
+        receive(feedback, receiver).await
     }
 
     /// Returns up to `maximum` missing heights in an authenticated range.
-    pub fn missing(
+    pub async fn missing(
         &mut self,
         retirement: Retirement,
         maximum: NonZeroUsize,
-    ) -> oneshot::Receiver<Vec<Height>> {
+    ) -> Result<Vec<Height>, RequestError> {
         let (response, receiver) = oneshot::channel();
-        let _ = self.sender.enqueue(Message::Missing {
+        let feedback = self.sender.enqueue(Message::Missing {
             retirement,
             maximum,
             response,
         });
-        receiver
+        receive(feedback, receiver).await
+    }
+}
+
+async fn receive<T>(
+    feedback: Feedback,
+    receiver: oneshot::Receiver<T>,
+) -> Result<T, RequestError> {
+    match feedback {
+        Feedback::Ok => receiver.await.map_err(|_| RequestError::Closed),
+        Feedback::Backoff => Err(RequestError::Backpressured),
+        Feedback::Closed => Err(RequestError::Closed),
     }
 }
 

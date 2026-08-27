@@ -70,6 +70,8 @@ mod mailbox;
 pub use mailbox::{Mailbox, Message};
 
 pub mod aggregation;
+pub mod aggregation_parked;
+pub mod aggregation_router;
 pub mod checkpoints;
 
 mod actor;
