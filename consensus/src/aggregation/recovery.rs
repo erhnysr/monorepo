@@ -8,7 +8,6 @@ use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use std::{
     collections::{BTreeSet, VecDeque},
     num::NonZeroUsize,
-    marker::PhantomData,
 };
 
 /// Requests and cancels aggregation certificate recovery.
@@ -102,40 +101,49 @@ mod tests {
     }
 
     #[test]
-    fn cap_dedup_exact_cancel_and_fifo_across_scopes() {
+    fn pre_attachment_cap_dedup_exact_cancel_and_fifo_across_scopes() {
         deterministic::Runner::default().start(|context| async move {
             let resolver = MockResolver::default();
             let state = resolver.state.clone();
-            let (mut coordinator, _) = RecoveryCoordinator::new(
-                context,
-                resolver,
+            let (coordinator, mut recovery) = RecoveryCoordinator::staged(
+                context.child("coordinator"),
                 NZUsize!(2),
                 NZUsize!(16),
             );
             let keys = [key(1, 0), key(2, 0), key(1, 1), key(2, 1)];
 
-            coordinator.fetch(keys[0]);
-            coordinator.fetch(keys[1]);
-            coordinator.fetch(keys[2]);
-            coordinator.fetch(keys[3]);
-            coordinator.fetch(keys[2]);
-            coordinator.cancel(keys[3]);
-            coordinator.cancel(keys[0]);
-            coordinator.cancel(keys[1]);
+            recovery.fetch(keys[0]);
+            recovery.fetch(keys[1]);
+            recovery.fetch(keys[2]);
+            recovery.fetch(keys[3]);
+            recovery.fetch(keys[2]);
+            recovery.cancel(keys[3]);
+            recovery.cancel(keys[0]);
+            recovery.cancel(keys[1]);
 
-            let state = state.lock();
-            assert_eq!(state.high_water, 2);
-            assert_eq!(
-                state.events,
-                vec![
-                    (true, keys[0]),
-                    (true, keys[1]),
-                    (false, keys[0]),
-                    (true, keys[2]),
-                    (false, keys[1]),
-                ]
-            );
-            assert_eq!(state.active, BTreeSet::from([keys[2]]));
+            let handle = coordinator.attach(resolver).start();
+            while state.lock().events.len() < 5 {
+                context.sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            {
+                let state = state.lock();
+                assert_eq!(state.high_water, 2);
+                assert_eq!(
+                    state.events,
+                    vec![
+                        (true, keys[0]),
+                        (true, keys[1]),
+                        (false, keys[0]),
+                        (true, keys[2]),
+                        (false, keys[1]),
+                    ]
+                );
+                assert_eq!(state.active, BTreeSet::from([keys[2]]));
+            }
+
+            context.child("stop").stop(0, None).await.unwrap();
+            handle.await.expect("recovery coordinator failed");
         });
     }
 
@@ -183,21 +191,19 @@ impl mailbox::Policy for Message {
 }
 
 /// Cloneable handle to a node-wide aggregation recovery coordinator.
-pub struct Recovery<R> {
+pub struct Recovery {
     mailbox: mailbox::Sender<Message>,
-    _resolver: PhantomData<fn() -> R>,
 }
 
-impl<R> Clone for Recovery<R> {
+impl Clone for Recovery {
     fn clone(&self) -> Self {
         Self {
             mailbox: self.mailbox.clone(),
-            _resolver: PhantomData,
         }
     }
 }
 
-impl<R: Send + 'static> Recoverer for Recovery<R> {
+impl Recoverer for Recovery {
     fn fetch(&mut self, key: RecoveryKey) -> Feedback {
         self.mailbox.enqueue(Message::Fetch(key))
     }
@@ -215,7 +221,6 @@ impl<R: Send + 'static> Recoverer for Recovery<R> {
 pub struct RecoveryCoordinator<E, R>
 where
     E: Spawner + Metrics,
-    R: Resolver<Key = RecoveryKey, Subscriber = ()>,
 {
     context: ContextCell<E>,
     resolver: R,
@@ -237,23 +242,10 @@ where
         resolver: R,
         outstanding: NonZeroUsize,
         mailbox_size: NonZeroUsize,
-    ) -> (Self, Recovery<R>) {
-        let (mailbox, receiver) = mailbox::new(context.child("mailbox"), mailbox_size);
-        (
-            Self {
-                context: ContextCell::new(context),
-                resolver,
-                receiver,
-                cap: outstanding.get(),
-                active: BTreeSet::new(),
-                queued: VecDeque::new(),
-                queued_set: BTreeSet::new(),
-            },
-            Recovery {
-                mailbox,
-                _resolver: PhantomData,
-            },
-        )
+    ) -> (Self, Recovery) {
+        let (coordinator, recovery) =
+            RecoveryCoordinator::<E, ()>::staged(context, outstanding, mailbox_size);
+        (coordinator.attach(resolver), recovery)
     }
 
     /// Starts the coordinator actor.
@@ -319,5 +311,50 @@ where
         let active = std::mem::take(&mut self.active);
         self.resolver
             .retain(move |key, ()| !active.contains(key));
+    }
+}
+
+impl<E> RecoveryCoordinator<E, ()>
+where
+    E: Spawner + Metrics,
+{
+    /// Creates a coordinator without a resolver and returns its cloneable handle.
+    ///
+    /// Requests may be enqueued through the handle before [`Self::attach`] supplies the resolver.
+    /// The attached coordinator must then be started to process them.
+    pub fn staged(
+        context: E,
+        outstanding: NonZeroUsize,
+        mailbox_size: NonZeroUsize,
+    ) -> (Self, Recovery) {
+        let (mailbox, receiver) = mailbox::new(context.child("mailbox"), mailbox_size);
+        (
+            Self {
+                context: ContextCell::new(context),
+                resolver: (),
+                receiver,
+                cap: outstanding.get(),
+                active: BTreeSet::new(),
+                queued: VecDeque::new(),
+                queued_set: BTreeSet::new(),
+            },
+            Recovery { mailbox },
+        )
+    }
+
+    /// Attaches the resolver required to start the coordinator.
+    pub fn attach<R>(self, resolver: R) -> RecoveryCoordinator<E, R>
+    where
+        R: Resolver<Key = RecoveryKey, Subscriber = ()>,
+    {
+        RecoveryCoordinator {
+            context: self.context,
+            resolver,
+            receiver: self.receiver,
+            cap: self.cap,
+            active: self.active,
+            queued: self.queued,
+            queued_set: self.queued_set,
+        }
     }
 }
