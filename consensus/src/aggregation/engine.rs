@@ -1,20 +1,18 @@
 //! Fixed per-epoch aggregation engine.
 
 use super::{
-    Config, Recoverer, metrics, scheme,
+    Config, Journal, JournalConfig, JournalIdentity, Recoverer, metrics, scheme,
     types::{Ack, Certificate, Error, Item, RecoveryKey, RecoveryNamespace},
 };
 use crate::{
     Automaton, Reporter,
     types::{Epoch, Height, Participant},
 };
-use bytes::{Buf, BufMut};
 use commonware_actor::mailbox::{
     self, UnreliablePolicy, UnreliableReceiver as MailboxReceiver,
     UnreliableSender as MailboxSender,
 };
-use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt, Write};
-use commonware_cryptography::{Digest, Hasher, Sha256, certificate::Verifier};
+use commonware_cryptography::{Digest, certificate::Verifier};
 use commonware_macros::select;
 use commonware_p2p::{
     Blocker, Receiver, Recipients, Sender,
@@ -22,17 +20,14 @@ use commonware_p2p::{
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{
-    BufferPooler, Clock, ContextCell, Handle, Metrics as RuntimeMetrics, ReadOptions, Spawner,
-    Storage,
-    buffer::paged::CacheRef,
+    BufferPooler, Clock, ContextCell, Handle, Metrics as RuntimeMetrics, Spawner, Storage,
     spawn_cell,
     telemetry::metrics::{GaugeExt, histogram, status::Status},
 };
-use commonware_storage::journal::segmented::variable::{Config as JournalConfig, Journal};
 use commonware_utils::{
     PrioritySet,
     channel::{fallible::OneshotExt, oneshot},
-    futures::{AbortablePool as FuturesPool, Aborter, rebind},
+    futures::{AbortablePool as FuturesPool, Aborter},
     non_empty,
     ordered::Quorum,
 };
@@ -40,111 +35,10 @@ use futures::{Future, FutureExt as _, future::{self, Either}};
 use rand_core::CryptoRng;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    num::{NonZeroU64, NonZeroUsize},
+    num::NonZeroUsize,
     time::{Duration, SystemTime},
 };
 use tracing::{debug, info, warn};
-
-const JOURNAL_VERSION: u8 = 3;
-const JOURNAL_COMMITTEE_DOMAIN: &[u8] = b"_COMMONWARE_CONSENSUS_AGGREGATION_JOURNAL_COMMITTEE_V1";
-type IdentityDigest = <Sha256 as Hasher>::Digest;
-
-/// The first record binds all subsequent trusted records to one engine identity.
-#[derive(Clone, Debug)]
-struct Header {
-    version: u8,
-    recovery_namespace: RecoveryNamespace,
-    committee: IdentityDigest,
-    epoch: Epoch,
-    first: Height,
-    last: Height,
-    window: u64,
-}
-
-impl Write for Header {
-    fn write(&self, writer: &mut impl BufMut) {
-        self.version.write(writer);
-        self.recovery_namespace.write(writer);
-        self.committee.write(writer);
-        self.epoch.write(writer);
-        self.first.write(writer);
-        self.last.write(writer);
-        self.window.write(writer);
-    }
-}
-
-impl Read for Header {
-    type Cfg = ();
-
-    fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
-        Ok(Self {
-            version: u8::read(reader)?,
-            recovery_namespace: RecoveryNamespace::read(reader)?,
-            committee: IdentityDigest::read(reader)?,
-            epoch: Epoch::read(reader)?,
-            first: Height::read(reader)?,
-            last: Height::read(reader)?,
-            window: u64::read(reader)?,
-        })
-    }
-}
-
-impl EncodeSize for Header {
-    fn encode_size(&self) -> usize {
-        self.version.encode_size()
-            + self.recovery_namespace.encode_size()
-            + self.committee.encode_size()
-            + self.epoch.encode_size()
-            + self.first.encode_size()
-            + self.last.encode_size()
-            + self.window.encode_size()
-    }
-}
-
-#[derive(Clone, Debug)]
-enum Record<S: commonware_cryptography::certificate::Scheme, D: Digest> {
-    Header(Header),
-    Certificate(Certificate<S, D>),
-}
-
-impl<S: commonware_cryptography::certificate::Scheme, D: Digest> Write for Record<S, D> {
-    fn write(&self, writer: &mut impl BufMut) {
-        match self {
-            Self::Header(header) => {
-                0u8.write(writer);
-                header.write(writer);
-            }
-            Self::Certificate(certificate) => {
-                1u8.write(writer);
-                certificate.write(writer);
-            }
-        }
-    }
-}
-
-impl<S: commonware_cryptography::certificate::Scheme, D: Digest> Read for Record<S, D> {
-    type Cfg = <S::Certificate as Read>::Cfg;
-
-    fn read_cfg(reader: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        match u8::read(reader)? {
-            0 => Ok(Self::Header(Header::read(reader)?)),
-            1 => Ok(Self::Certificate(Certificate::read_cfg(reader, cfg)?)),
-            _ => Err(CodecError::Invalid(
-                "consensus::aggregation::Record",
-                "invalid type",
-            )),
-        }
-    }
-}
-
-impl<S: commonware_cryptography::certificate::Scheme, D: Digest> EncodeSize for Record<S, D> {
-    fn encode_size(&self) -> usize {
-        1 + match self {
-            Self::Header(v) => v.encode_size(),
-            Self::Certificate(v) => v.encode_size(),
-        }
-    }
-}
 
 enum Pending<S: commonware_cryptography::certificate::Scheme, D: Digest> {
     Unverified(BTreeMap<Participant, Ack<S, D>>),
@@ -266,13 +160,8 @@ where
     recoverer: R,
     recovery_ticks: BTreeMap<Height, u64>,
     recovery_requested: BTreeSet<RecoveryKey>,
-    journal: Option<Journal<E, Record<S, D>>>,
-    journal_partition: String,
-    journal_write_buffer: NonZeroUsize,
-    journal_replay_buffer: NonZeroUsize,
-    journal_heights_per_section: NonZeroU64,
-    journal_compression: Option<u8>,
-    journal_page_cache: CacheRef,
+    journal: Option<Journal<E, S, D>>,
+    journal_config: JournalConfig,
     priority_acks: bool,
     certificate_mailbox: MailboxReceiver<CertificateMessage<S, D>>,
     // Keep the mailbox open so its receive branch remains pending without external senders.
@@ -303,6 +192,21 @@ where
             mailbox::new_unreliable(context.child("mailbox"), mailbox_capacity);
         let mailbox = Mailbox { sender };
         let recovery_namespace = cfg.scheme.recovery_namespace();
+        let journal_config = JournalConfig {
+            identity: JournalIdentity::new(
+                &cfg.scheme,
+                cfg.epoch,
+                cfg.first,
+                cfg.last,
+                cfg.window,
+            ),
+            partition: cfg.journal_partition,
+            write_buffer: cfg.journal_write_buffer,
+            replay_buffer: cfg.journal_replay_buffer,
+            heights_per_section: cfg.journal_heights_per_section,
+            compression: cfg.journal_compression,
+            page_cache: cfg.journal_page_cache,
+        };
         let engine = Self {
             context: ContextCell::new(context),
             epoch: cfg.epoch,
@@ -328,12 +232,7 @@ where
             recovery_ticks: BTreeMap::new(),
             recovery_requested: BTreeSet::new(),
             journal: None,
-            journal_partition: cfg.journal_partition,
-            journal_write_buffer: cfg.journal_write_buffer,
-            journal_replay_buffer: cfg.journal_replay_buffer,
-            journal_heights_per_section: cfg.journal_heights_per_section,
-            journal_compression: cfg.journal_compression,
-            journal_page_cache: cfg.journal_page_cache,
+            journal_config,
             priority_acks: cfg.priority_acks,
             certificate_mailbox,
             _mailbox_keepalive: mailbox.clone(),
@@ -516,7 +415,7 @@ where
         };
 
         self.cancel_all_recovery();
-        if let Some(journal) = self.journal.take() {
+        if let Some(mut journal) = self.journal.take() {
             journal
                 .sync_all()
                 .await
@@ -780,119 +679,29 @@ where
         }
     }
 
-    fn expected_header(&self) -> Header {
-        let participants = self.scheme.participants().encode();
-        let committee = Sha256::hash(&[JOURNAL_COMMITTEE_DOMAIN, participants.as_ref()]);
-        Header {
-            version: JOURNAL_VERSION,
-            recovery_namespace: self.recovery_namespace,
-            committee,
-            epoch: self.epoch,
-            first: self.first,
-            last: self.last,
-            window: self.window,
-        }
-    }
-
     async fn init_journal(&mut self) -> bool {
-        let cfg = JournalConfig {
-            partition: self.journal_partition.clone(),
-            compression: self.journal_compression,
-            codec_config: S::certificate_codec_config_unbounded(),
-            page_cache: self.journal_page_cache.clone(),
-            write_buffer: self.journal_write_buffer,
-        };
-        let journal = Journal::init(self.context.child("journal"), cfg)
-            .await
-            .expect("aggregation journal init failed");
-        let empty = journal.is_empty();
-        let mut replay = journal
-            .replay(0, 0, self.journal_replay_buffer, ReadOptions::DONT_CACHE)
-            .await
-            .expect("aggregation journal replay failed");
-        let expected = self.expected_header();
-        let mut first_record = true;
-        while let Some(record) = replay.next().await {
-            let (_, _, _, record) = record.expect("corrupt aggregation journal");
-            match (first_record, record) {
-                (true, Record::Header(header)) => {
-                    assert_eq!(
-                        header.version, expected.version,
-                        "aggregation journal version mismatch"
-                    );
-                    assert_eq!(
-                        header.recovery_namespace, expected.recovery_namespace,
-                        "aggregation journal namespace digest mismatch"
-                    );
-                    assert_eq!(
-                        header.committee, expected.committee,
-                        "aggregation journal committee mismatch"
-                    );
-                    assert_eq!(
-                        header.epoch, expected.epoch,
-                        "aggregation journal epoch mismatch"
-                    );
-                    assert_eq!(
-                        header.first, expected.first,
-                        "aggregation journal first-position mismatch"
-                    );
-                    assert_eq!(
-                        header.last, expected.last,
-                        "aggregation journal last-position mismatch"
-                    );
-                    assert_eq!(
-                        header.window, expected.window,
-                        "aggregation journal window mismatch; durably archive the complete range before replacing the journal"
-                    );
-                }
-                (true, _) => panic!("aggregation journal header missing"),
-                (false, Record::Header(_)) => panic!("duplicate aggregation journal header"),
-                (false, Record::Certificate(certificate)) => {
-                    self.replay_certificate(certificate)
-                }
-            }
-            first_record = false;
+        let context = self.context.child("journal");
+        let (journal, certificates) = Journal::init(
+            context,
+            self.journal_config.clone(),
+            self.context.as_mut(),
+            &self.scheme,
+            &self.strategy,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("aggregation journal init failed: {error}"));
+        let restarted = journal.restarted();
+        for certificate in certificates {
+            self.replay_certificate(certificate);
         }
-        let journal = replay.finish().expect("aggregation journal replay failed");
-        if empty {
-            assert!(first_record);
-            let (journal, _, _) = journal
-                .append(0, &Record::Header(expected))
-                .await
-                .expect("journal header append failed");
-            self.journal = Some(journal.sync(0).await.expect("journal header sync failed"));
-        } else {
-            assert!(!first_record, "aggregation journal header missing");
-            self.journal = Some(journal);
-        }
+        self.journal = Some(journal);
         info!(epoch = %self.epoch, first = %self.first, last = %self.last, frontier = %self.frontier, "replayed aggregation journal");
-        !empty
+        restarted
     }
 
     fn replay_certificate(&mut self, certificate: Certificate<S, D>) {
-        // The header does not bind all namespace and threshold-verifier material, so revalidate
-        // every certificate.
         let position = certificate.item.position;
         self.recoverer.cancel(self.recovery_key(position));
-        assert_eq!(
-            certificate.epoch, self.epoch,
-            "journal certificate epoch mismatch"
-        );
-        assert!(
-            position >= self.first && position <= self.last,
-            "journal certificate outside range"
-        );
-        assert!(
-            certificate.verify_for(
-                self.context.as_mut(),
-                &self.scheme,
-                self.epoch,
-                self.first,
-                self.last,
-                &self.strategy,
-            ),
-            "journal certificate signature mismatch"
-        );
         if position >= self.frontier {
             if let Some(existing) = self.confirmed.insert(position, certificate.clone()) {
                 assert_eq!(
@@ -913,17 +722,12 @@ where
     }
 
     async fn record_certificate(&mut self, certificate: Certificate<S, D>) {
-        let position = certificate.item.position;
-        let section = position.get() / self.journal_heights_per_section.get();
-        let record = Record::Certificate(certificate);
-        rebind(&mut self.journal, |journal| {
-            journal.append(section, &record)
-        })
-        .await
-        .expect("unable to append aggregation journal");
-        rebind(&mut self.journal, |journal| journal.sync(section))
+        self.journal
+            .as_mut()
+            .expect("journal unavailable")
+            .append(certificate)
             .await
-            .expect("unable to sync aggregation journal");
+            .expect("unable to append aggregation journal");
     }
 }
 
@@ -935,7 +739,7 @@ mod tests {
         simplex::mocks::wrapped::{Behavior, Scheme as WrappedScheme},
     };
     use commonware_actor::Feedback;
-    use commonware_cryptography::{Sha256, certificate::mocks::Fixture};
+    use commonware_cryptography::{Hasher, Sha256, certificate::mocks::Fixture};
 
     #[derive(Clone)]
     struct NoopRecoverer;
@@ -950,8 +754,11 @@ mod tests {
         }
     }
     use commonware_parallel::Sequential;
-    use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+    use commonware_runtime::{
+        Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
+    };
     use commonware_utils::{NZU16, NZUsize, NonZeroDuration};
+    use std::num::NonZeroU64;
 
     #[derive(Clone)]
     struct NoopAutomaton;

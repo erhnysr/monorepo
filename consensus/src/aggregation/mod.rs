@@ -35,6 +35,8 @@ cfg_if::cfg_if! {
         pub use config::Config;
         mod engine;
         pub use engine::{CertificateOutcome, Engine, EngineOutcome, Mailbox, Stopper};
+        mod journal;
+        pub use journal::{Journal, JournalConfig, JournalError, JournalIdentity};
         mod metrics;
         mod recovery;
         pub use recovery::{Recoverer, Recovery, RecoveryCoordinator};

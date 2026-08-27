@@ -1,5 +1,6 @@
 use super::{
-    CertificateOutcome, Config, Engine, EngineOutcome, Recoverer,
+    CertificateOutcome, Config, Engine, EngineOutcome, Journal, JournalConfig, JournalError,
+    JournalIdentity, Recoverer,
     scheme::{self, Scheme},
     types::{Ack, Certificate, Item, RecoveryKey, RecoveryNamespace},
 };
@@ -1138,6 +1139,99 @@ where
 #[test_traced("INFO")]
 fn test_journal_replay_binds_engine_identity() {
     journal_identity(scheme::ed25519::fixture);
+}
+
+#[test_traced("INFO")]
+fn test_journal_facade_rejects_mismatch_and_destroys_exact_journal() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 1);
+        let scheme = fixture.schemes[0].clone();
+        let participant = fixture.participants[0].clone();
+        let epoch = Epoch::new(17);
+        let position = Height::new(140);
+        let partition = "aggregation-facade-destroy";
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, false).await;
+        let engine_cfg = config(
+            &context,
+            scheme.clone(),
+            ImmediateApplication::default(),
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: partition.into(),
+                epoch,
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        let journal_cfg = JournalConfig {
+            identity: JournalIdentity::new::<scheme::ed25519::Scheme, Sha256Digest>(
+                &scheme,
+                epoch,
+                position,
+                position,
+                NonZeroU64::new(1).unwrap(),
+            ),
+            partition: partition.into(),
+            write_buffer: NZUsize!(4096),
+            replay_buffer: NZUsize!(4096),
+            heights_per_section: NonZeroU64::new(4).unwrap(),
+            compression: None,
+            page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
+        };
+        let (engine, _mailbox) = Engine::new(context.child("engine"), engine_cfg);
+        assert_eq!(
+            engine
+                .start(registrations.remove(&participant).unwrap())
+                .await
+                .unwrap(),
+            EngineOutcome::Completed
+        );
+
+        let mut mismatch = journal_cfg.clone();
+        mismatch.identity.epoch = epoch.next();
+        let journal_context = context.child("mismatch");
+        let result = Journal::<_, scheme::ed25519::Scheme, Sha256Digest>::init(
+            journal_context,
+            mismatch,
+            &mut context,
+            &scheme,
+            &Sequential,
+        )
+        .await;
+        assert!(matches!(result, Err(JournalError::EpochMismatch)));
+
+        let journal_context = context.child("verified");
+        let (journal, certificates) =
+            Journal::<_, scheme::ed25519::Scheme, Sha256Digest>::init(
+            journal_context,
+            journal_cfg.clone(),
+            &mut context,
+            &scheme,
+            &Sequential,
+        )
+        .await
+        .unwrap();
+        assert_eq!(certificates.len(), 1);
+        assert_eq!(certificates[0].item.position, position);
+        journal.destroy().await.unwrap();
+
+        let journal_context = context.child("after_destroy");
+        let (journal, certificates) =
+            Journal::<_, scheme::ed25519::Scheme, Sha256Digest>::init(
+            journal_context,
+            journal_cfg,
+            &mut context,
+            &scheme,
+            &Sequential,
+        )
+        .await
+        .unwrap();
+        assert!(certificates.is_empty());
+        journal.destroy().await.unwrap();
+    });
 }
 
 #[test_traced("INFO")]
