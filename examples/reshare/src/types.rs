@@ -9,7 +9,7 @@ use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Epochable, Heightable, Reporter, aggregation,
     marshal::Update,
     simplex::{self, types::Context},
-    types::{Epoch, Height, Round, View},
+    types::{Epoch, Epocher, FixedEpocher, Height, Round, View},
 };
 use commonware_cryptography::{
     Digest as _, Digestible, Hasher, Sha256,
@@ -17,7 +17,7 @@ use commonware_cryptography::{
         dkg::feldman_desmedt::{DealerPrivMsg, Reveal},
         primitives::{
             group::Share,
-            sharing::{Mode, ModeVersion},
+            sharing::{Mode, ModeVersion, Sharing},
             variant::MinSig,
         },
     },
@@ -103,6 +103,12 @@ pub const QMDB_CHANNEL: u64 = 5;
 pub const DKG_CHANNEL: u64 = 6;
 /// P2P channel for the DKG probe.
 pub const DKG_PROBE_CHANNEL: u64 = 7;
+/// P2P channel carrying epoch-multiplexed aggregation shares.
+pub const AGGREGATION_ACK_CHANNEL: u64 = 8;
+/// P2P channel serving aggregation certificate recovery.
+pub const AGGREGATION_RECOVERY_CHANNEL: u64 = 9;
+/// Current epoch plus two draining aggregation epochs remain network-active.
+pub const AGGREGATION_ACTIVE_EPOCHS: std::num::NonZeroUsize = NZUsize!(3);
 /// Mailbox capacity for every actor.
 pub const MAILBOX_SIZE: std::num::NonZeroUsize = NZUsize!(100);
 /// Per-peer message quota for every P2P channel.
@@ -221,16 +227,26 @@ impl ReshareBlock for Block {
     }
 }
 
+impl commonware_glue::dkg::orchestrator::checkpoints::FinalizedBlock for Block {
+    type Checkpoint = sha256::Digest;
+
+    fn finalized_checkpoint(&self) -> (Height, Self::Checkpoint) {
+        (self.height, self.state_root)
+    }
+}
+
 /// Certificate provider whose per-epoch schemes are registered as ceremonies complete.
 #[derive(Clone)]
 pub struct DynamicProvider<S = Scheme> {
     schemes: Arc<Mutex<HashMap<Epoch, Arc<S>>>>,
+    descriptors: Option<FileSecretStore>,
 }
 
 impl<S> Default for DynamicProvider<S> {
     fn default() -> Self {
         Self {
             schemes: Arc::default(),
+            descriptors: None,
         }
     }
 }
@@ -255,6 +271,90 @@ where
 
     fn scheme(&self, scope: Self::Scope) -> Option<Arc<Self::Scheme>> {
         self.schemes.lock().get(&scope).cloned()
+    }
+}
+
+impl commonware_glue::dkg::orchestrator::aggregation::Provider<AggregationScheme>
+    for DynamicProvider<AggregationScheme>
+{
+    fn epoch(
+        &self,
+        namespace: aggregation::types::RecoveryNamespace,
+        epoch: Epoch,
+    ) -> Option<
+        commonware_glue::dkg::orchestrator::aggregation::AuthenticatedEpoch<AggregationScheme>,
+    > {
+        let scheme = self.schemes.lock().get(&epoch).cloned()?;
+        if <AggregationScheme as aggregation::scheme::Scheme<sha256::Digest>>::recovery_namespace(
+            &scheme,
+        ) != namespace
+        {
+            return None;
+        }
+        let epocher = FixedEpocher::new(BLOCKS_PER_EPOCH);
+        commonware_glue::dkg::orchestrator::aggregation::AuthenticatedEpoch::new(
+            scheme,
+            epocher.first(epoch)?,
+            epocher.last(epoch)?,
+        )
+    }
+
+    fn oldest_epoch(&self, namespace: aggregation::types::RecoveryNamespace) -> Option<Epoch> {
+        self.schemes
+            .lock()
+            .iter()
+            .filter(|(_, scheme)| {
+                <AggregationScheme as aggregation::scheme::Scheme<sha256::Digest>>::recovery_namespace(
+                    scheme,
+                ) == namespace
+            })
+            .map(|(epoch, _)| *epoch)
+            .min()
+    }
+}
+
+impl DynamicProvider<AggregationScheme> {
+    /// Reconstruct every durably described aggregation epoch from `store`.
+    #[allow(dead_code, reason = "used by validator startup integration")]
+    pub fn load(store: FileSecretStore) -> anyhow::Result<Self> {
+        let provider = Self {
+            schemes: Arc::default(),
+            descriptors: Some(store.clone()),
+        };
+        for (epoch, descriptor) in store.descriptors() {
+            let share = store.share(epoch)?;
+            provider.register(epoch, descriptor.scheme(epoch, share)?);
+        }
+        Ok(provider)
+    }
+
+    /// Register and durably describe an authenticated aggregation epoch.
+    pub fn register_authenticated(
+        &self,
+        epoch: Epoch,
+        participants: Set<ed25519::PublicKey>,
+        sharing: Sharing<MinSig>,
+        share: Option<Share>,
+    ) -> anyhow::Result<()> {
+        let scheme = match share {
+            Some(share) => AggregationScheme::signer(
+                AGGREGATION_NAMESPACE,
+                participants.clone(),
+                sharing.clone(),
+                share,
+            )
+            .ok_or_else(|| anyhow::anyhow!("share does not match aggregation epoch {epoch}"))?,
+            None => AggregationScheme::verifier(
+                AGGREGATION_NAMESPACE,
+                participants.clone(),
+                sharing.clone(),
+            ),
+        };
+        if let Some(store) = &self.descriptors {
+            store.put_descriptor(epoch, &participants, &sharing)?;
+        }
+        self.register(epoch, scheme);
+        Ok(())
     }
 }
 
@@ -287,27 +387,28 @@ impl RegistrarTrait for Registrar {
         epoch: Epoch,
         info: dkg::types::SchemeInfo<Self::Variant, Self::PublicKey>,
     ) {
-        let aggregation_scheme = match &info {
+        match &info {
             dkg::types::SchemeInfo::Verifier {
                 participants,
                 sharing,
-            } => AggregationScheme::verifier(
-                AGGREGATION_NAMESPACE,
+            } => self.aggregation_provider.register_authenticated(
+                epoch,
                 participants.clone(),
                 sharing.clone(),
+                None,
             ),
             dkg::types::SchemeInfo::Signer {
                 participants,
                 sharing,
                 share,
-            } => AggregationScheme::signer(
-                AGGREGATION_NAMESPACE,
+            } => self.aggregation_provider.register_authenticated(
+                epoch,
                 participants.clone(),
                 sharing.clone(),
-                share.clone(),
-            )
-            .expect("registered share must match aggregation participant set"),
-        };
+                Some(share.clone()),
+            ),
+        }
+        .expect("failed to persist aggregation epoch");
         let scheme = match info {
             dkg::types::SchemeInfo::Verifier {
                 participants,
@@ -321,8 +422,6 @@ impl RegistrarTrait for Registrar {
                 .expect("registered share must match participant set"),
         };
         self.provider.register(epoch, scheme);
-        self.aggregation_provider
-            .register(epoch, aggregation_scheme);
     }
 }
 
@@ -396,11 +495,75 @@ pub struct FileSecretStore {
     inner: Arc<Mutex<SecretData>>,
 }
 
+/// Secret-store wrapper that honors aggregation's durable discovery floor.
+#[derive(Clone)]
+pub struct RetainedSecretStore {
+    inner: FileSecretStore,
+    history: commonware_glue::dkg::orchestrator::aggregation::Handler,
+    namespace: aggregation::types::RecoveryNamespace,
+}
+
+impl RetainedSecretStore {
+    /// Retains every epoch that may still need an aggregation signer after restart.
+    pub const fn new(
+        inner: FileSecretStore,
+        history: commonware_glue::dkg::orchestrator::aggregation::Handler,
+        namespace: aggregation::types::RecoveryNamespace,
+    ) -> Self {
+        Self {
+            inner,
+            history,
+            namespace,
+        }
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct SecretData {
     shares: BTreeMap<u64, String>,
     seeds: BTreeMap<u64, String>,
     dealings: BTreeMap<String, String>,
+    #[serde(default)]
+    aggregation_epochs: BTreeMap<u64, AggregationEpochDescriptor>,
+}
+
+/// Minimum authenticated public material needed to rebuild an aggregation epoch.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct AggregationEpochDescriptor {
+    participants: String,
+    sharing: String,
+}
+
+impl AggregationEpochDescriptor {
+    fn decode(&self) -> anyhow::Result<(Set<ed25519::PublicKey>, Sharing<MinSig>)> {
+        let participants = from_hex(&self.participants)
+            .ok_or_else(|| anyhow::anyhow!("invalid aggregation participants hex"))?;
+        let sharing = from_hex(&self.sharing)
+            .ok_or_else(|| anyhow::anyhow!("invalid aggregation sharing hex"))?;
+        Ok((
+            Set::decode_cfg(
+                participants.as_slice(),
+                &(
+                    commonware_codec::RangeCfg::new(1..=MAX_PARTICIPANTS.get() as usize),
+                    (),
+                ),
+            )?,
+            Sharing::decode_cfg(sharing.as_slice(), &(MAX_PARTICIPANTS, MAX_SUPPORTED_MODE))?,
+        ))
+    }
+
+    fn scheme(&self, epoch: Epoch, share: Option<Share>) -> anyhow::Result<AggregationScheme> {
+        let (participants, sharing) = self.decode()?;
+        Ok(match share {
+            Some(share) => {
+                AggregationScheme::signer(AGGREGATION_NAMESPACE, participants, sharing, share)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("stored share does not match aggregation epoch {epoch}")
+                    })?
+            }
+            None => AggregationScheme::verifier(AGGREGATION_NAMESPACE, participants, sharing),
+        })
+    }
 }
 
 impl FileSecretStore {
@@ -435,6 +598,46 @@ impl FileSecretStore {
         let contents = serde_json::to_string_pretty(&*self.inner.lock())?;
         fs::write(&self.path, contents)?;
         Ok(())
+    }
+
+    fn put_descriptor(
+        &self,
+        epoch: Epoch,
+        participants: &Set<ed25519::PublicKey>,
+        sharing: &Sharing<MinSig>,
+    ) -> anyhow::Result<()> {
+        let descriptor = AggregationEpochDescriptor {
+            participants: hex(&participants.encode()),
+            sharing: hex(&sharing.encode()),
+        };
+        let mut inner = self.inner.lock();
+        if inner
+            .aggregation_epochs
+            .get(&epoch.get())
+            .is_some_and(|existing| existing != &descriptor)
+        {
+            anyhow::bail!("refusing to replace aggregation epoch {epoch}");
+        }
+        inner.aggregation_epochs.insert(epoch.get(), descriptor);
+        drop(inner);
+        self.flush()
+    }
+
+    fn descriptors(&self) -> Vec<(Epoch, AggregationEpochDescriptor)> {
+        self.inner
+            .lock()
+            .aggregation_epochs
+            .iter()
+            .map(|(&epoch, descriptor)| (Epoch::new(epoch), descriptor.clone()))
+            .collect()
+    }
+
+    fn share(&self, epoch: Epoch) -> anyhow::Result<Option<Share>> {
+        let Some(raw) = self.inner.lock().shares.get(&epoch.get()).cloned() else {
+            return Ok(None);
+        };
+        let bytes = from_hex(&raw).ok_or_else(|| anyhow::anyhow!("invalid share hex"))?;
+        Ok(Some(Share::decode(bytes.as_slice())?))
     }
 
     fn dealing_key<P: commonware_cryptography::PublicKey>(epoch: Epoch, dealer: &P) -> String {
@@ -505,8 +708,65 @@ impl dkg::SecretStore for FileSecretStore {
                 .and_then(|(epoch, _)| epoch.parse::<u64>().ok())
                 .is_some_and(|epoch| epoch >= min.get())
         });
+        inner
+            .aggregation_epochs
+            .retain(|epoch, _| *epoch >= min.get());
         drop(inner);
         self.flush().expect("failed to flush prune");
+    }
+}
+
+impl dkg::SecretStore for RetainedSecretStore {
+    async fn put_share(&mut self, epoch: Epoch, share: Share) {
+        self.inner.put_share(epoch, share).await;
+    }
+
+    async fn get_share(&mut self, epoch: Epoch) -> Option<Share> {
+        self.inner.get_share(epoch).await
+    }
+
+    async fn put_seed(&mut self, epoch: Epoch, seed: Summary) {
+        self.inner.put_seed(epoch, seed).await;
+    }
+
+    async fn get_seed(&mut self, epoch: Epoch) -> Option<Summary> {
+        self.inner.get_seed(epoch).await
+    }
+
+    async fn put_dealing<P: commonware_cryptography::PublicKey>(
+        &mut self,
+        epoch: Epoch,
+        dealer: P,
+        private: DealerPrivMsg,
+    ) {
+        self.inner.put_dealing(epoch, dealer, private).await;
+    }
+
+    async fn get_dealing<P: commonware_cryptography::PublicKey>(
+        &mut self,
+        epoch: Epoch,
+        dealer: &P,
+    ) -> Option<DealerPrivMsg> {
+        self.inner.get_dealing(epoch, dealer).await
+    }
+
+    async fn prune(&mut self, requested: Epoch) {
+        let safe = retained_prune_epoch(
+            requested,
+            self.history
+                .oldest_unretired(self.namespace)
+                .await
+                .map_err(|_| ()),
+        );
+        self.inner.prune(safe).await;
+    }
+}
+
+fn retained_prune_epoch(requested: Epoch, floor: Result<Option<Epoch>, ()>) -> Epoch {
+    match floor {
+        Ok(Some(floor)) => std::cmp::min(requested, floor),
+        Ok(None) => requested,
+        Err(()) => Epoch::zero(),
     }
 }
 
@@ -639,6 +899,18 @@ mod tests {
             .collect()
     }
 
+    fn aggregation_material(seed: u64) -> (Set<ed25519::PublicKey>, Sharing<MinSig>, Share) {
+        let participants = Set::from_iter_dedup(keys(4));
+        let (output, shares) =
+            deal::<MinSig, _, N3f1>(TestRng::new(seed), SHARING_MODE, participants.clone())
+                .unwrap();
+        let share = shares
+            .get_value(participants.iter().next().unwrap())
+            .unwrap()
+            .clone();
+        (participants, output.public().clone(), share)
+    }
+
     #[test]
     fn participants_rotate_with_wraparound() {
         let participants = keys(4);
@@ -758,6 +1030,117 @@ mod tests {
                 assert_eq!(store.get_share(Epoch::new(1)).await, None);
             }
         });
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn aggregation_provider_reconstructs_signers_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "commonware-reshare-aggregation-restart-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = FileSecretStore::load(&path).unwrap();
+        let epoch = Epoch::new(3);
+        let (participants, sharing, share) = aggregation_material(31);
+        store.put_initial_share(epoch, share.clone()).unwrap();
+
+        let provider = DynamicProvider::<AggregationScheme>::load(store).unwrap();
+        provider
+            .register_authenticated(epoch, participants, sharing, Some(share))
+            .unwrap();
+        let verifier_epoch = Epoch::new(4);
+        let (participants, sharing, _) = aggregation_material(32);
+        provider
+            .register_authenticated(verifier_epoch, participants, sharing, None)
+            .unwrap();
+        let (participants, sharing, _) = aggregation_material(33);
+        assert!(
+            provider
+                .register_authenticated(epoch, participants, sharing, None)
+                .is_err()
+        );
+        drop(provider);
+
+        let provider =
+            DynamicProvider::<AggregationScheme>::load(FileSecretStore::load(&path).unwrap())
+                .unwrap();
+        assert!(provider.scheme(epoch).unwrap().share().is_some());
+        assert!(provider.scheme(verifier_epoch).unwrap().share().is_none());
+        let namespace =
+            <AggregationScheme as aggregation::scheme::Scheme<sha256::Digest>>::recovery_namespace(
+                &provider.scheme(epoch).unwrap(),
+            );
+        let authenticated = commonware_glue::dkg::orchestrator::aggregation::Provider::epoch(
+            &provider, namespace, epoch,
+        )
+        .unwrap();
+        let epocher = FixedEpocher::new(BLOCKS_PER_EPOCH);
+        assert_eq!(authenticated.first(), epocher.first(epoch).unwrap());
+        assert_eq!(authenticated.last(), epocher.last(epoch).unwrap());
+        assert_eq!(
+            commonware_glue::dkg::orchestrator::aggregation::Provider::oldest_epoch(
+                &provider, namespace,
+            ),
+            Some(epoch)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn aggregation_descriptors_follow_exact_prune_floor() {
+        let path = std::env::temp_dir().join(format!(
+            "commonware-reshare-aggregation-prune-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = FileSecretStore::load(&path).unwrap();
+        let provider = DynamicProvider::<AggregationScheme>::load(store.clone()).unwrap();
+        for (epoch, seed) in [(Epoch::new(1), 41), (Epoch::new(2), 42)] {
+            let (participants, sharing, share) = aggregation_material(seed);
+            store.put_initial_share(epoch, share.clone()).unwrap();
+            provider
+                .register_authenticated(epoch, participants, sharing, Some(share))
+                .unwrap();
+        }
+
+        commonware_runtime::deterministic::Runner::default().start(|_| async {
+            store.prune(Epoch::new(1)).await;
+        });
+        let restarted =
+            DynamicProvider::<AggregationScheme>::load(FileSecretStore::load(&path).unwrap())
+                .unwrap();
+        assert!(restarted.scheme(Epoch::new(1)).is_some());
+        assert!(restarted.scheme(Epoch::new(2)).is_some());
+
+        let mut store = FileSecretStore::load(&path).unwrap();
+        commonware_runtime::deterministic::Runner::default().start(|_| async {
+            store.prune(Epoch::new(2)).await;
+        });
+        let restarted =
+            DynamicProvider::<AggregationScheme>::load(FileSecretStore::load(&path).unwrap())
+                .unwrap();
+        assert!(restarted.scheme(Epoch::new(1)).is_none());
+        assert!(restarted.scheme(Epoch::new(2)).is_some());
+
+        let mut store = FileSecretStore::load(&path).unwrap();
+        commonware_runtime::deterministic::Runner::default().start(|_| async {
+            store.prune(Epoch::new(3)).await;
+        });
+        let restarted =
+            DynamicProvider::<AggregationScheme>::load(FileSecretStore::load(&path).unwrap())
+                .unwrap();
+        assert!(restarted.scheme(Epoch::new(2)).is_none());
+
+        assert_eq!(
+            retained_prune_epoch(Epoch::new(9), Ok(Some(Epoch::new(2)))),
+            Epoch::new(2)
+        );
+        assert_eq!(
+            retained_prune_epoch(Epoch::new(9), Ok(Some(Epoch::new(3)))),
+            Epoch::new(3)
+        );
+        assert_eq!(retained_prune_epoch(Epoch::new(9), Err(())), Epoch::zero());
         let _ = std::fs::remove_file(path);
     }
 }
