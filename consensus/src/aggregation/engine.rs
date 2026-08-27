@@ -1,8 +1,8 @@
 //! Fixed per-epoch aggregation engine.
 
 use super::{
-    Config, metrics, scheme,
-    types::{Ack, Certificate, Error, Item},
+    Config, Recoverer, metrics, scheme,
+    types::{Ack, Certificate, Error, Item, RecoveryKey, RecoveryNamespace},
 };
 use crate::{
     Automaton, Reporter,
@@ -39,13 +39,13 @@ use commonware_utils::{
 use futures::future::{self, Either};
 use rand_core::CryptoRng;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     num::{NonZeroU64, NonZeroUsize},
     time::{Duration, SystemTime},
 };
 use tracing::{debug, info, warn};
 
-const JOURNAL_VERSION: u8 = 2;
+const JOURNAL_VERSION: u8 = 3;
 const JOURNAL_COMMITTEE_DOMAIN: &[u8] = b"_COMMONWARE_CONSENSUS_AGGREGATION_JOURNAL_COMMITTEE_V1";
 type IdentityDigest = <Sha256 as Hasher>::Digest;
 
@@ -53,6 +53,7 @@ type IdentityDigest = <Sha256 as Hasher>::Digest;
 #[derive(Clone, Debug)]
 struct Header {
     version: u8,
+    recovery_namespace: RecoveryNamespace,
     committee: IdentityDigest,
     epoch: Epoch,
     first: Height,
@@ -63,6 +64,7 @@ struct Header {
 impl Write for Header {
     fn write(&self, writer: &mut impl BufMut) {
         self.version.write(writer);
+        self.recovery_namespace.write(writer);
         self.committee.write(writer);
         self.epoch.write(writer);
         self.first.write(writer);
@@ -77,6 +79,7 @@ impl Read for Header {
     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
         Ok(Self {
             version: u8::read(reader)?,
+            recovery_namespace: RecoveryNamespace::read(reader)?,
             committee: IdentityDigest::read(reader)?,
             epoch: Epoch::read(reader)?,
             first: Height::read(reader)?,
@@ -89,6 +92,7 @@ impl Read for Header {
 impl EncodeSize for Header {
     fn encode_size(&self) -> usize {
         self.version.encode_size()
+            + self.recovery_namespace.encode_size()
             + self.committee.encode_size()
             + self.epoch.encode_size()
             + self.first.encode_size()
@@ -215,7 +219,7 @@ impl<S: commonware_cryptography::certificate::Scheme, D: Digest> Mailbox<S, D> {
 }
 
 /// Aggregates every position in one immutable epoch and inclusive global range.
-pub struct Engine<E, S, D, A, Z, B, T>
+pub struct Engine<E, S, D, A, Z, B, T, R>
 where
     E: BufferPooler + Clock + Spawner + Storage + RuntimeMetrics + CryptoRng,
     S: scheme::Scheme<D>,
@@ -224,6 +228,7 @@ where
     Z: Reporter<Activity = Certificate<S, D>>,
     B: Blocker<PublicKey = <S as Verifier>::PublicKey>,
     T: Strategy,
+    R: Recoverer,
 {
     context: ContextCell<E>,
     epoch: Epoch,
@@ -243,6 +248,11 @@ where
     confirmed: BTreeMap<Height, Certificate<S, D>>,
     rebroadcast_timeout: Duration,
     rebroadcast_deadlines: PrioritySet<Height, SystemTime>,
+    recovery_after_rebroadcasts: u64,
+    recovery_namespace: RecoveryNamespace,
+    recoverer: R,
+    recovery_ticks: BTreeMap<Height, u64>,
+    recovery_requested: BTreeSet<RecoveryKey>,
     journal: Option<Journal<E, Record<S, D>>>,
     journal_partition: String,
     journal_write_buffer: NonZeroUsize,
@@ -257,7 +267,7 @@ where
     metrics: metrics::Metrics,
 }
 
-impl<E, S, D, A, Z, B, T> Engine<E, S, D, A, Z, B, T>
+impl<E, S, D, A, Z, B, T, R> Engine<E, S, D, A, Z, B, T, R>
 where
     E: BufferPooler + Clock + Spawner + Storage + RuntimeMetrics + CryptoRng,
     S: scheme::Scheme<D>,
@@ -266,9 +276,10 @@ where
     Z: Reporter<Activity = Certificate<S, D>>,
     B: Blocker<PublicKey = <S as Verifier>::PublicKey>,
     T: Strategy,
+    R: Recoverer,
 {
     /// Creates an engine. Panics if the configured range is empty.
-    pub fn new(context: E, cfg: Config<S, D, A, Z, B, T>) -> (Self, Mailbox<S, D>) {
+    pub fn new(context: E, cfg: Config<S, D, A, Z, B, T, R>) -> (Self, Mailbox<S, D>) {
         assert!(cfg.first <= cfg.last, "aggregation range must not be empty");
         let metrics = metrics::Metrics::init(&context);
         let mailbox_capacity = NonZeroUsize::new(
@@ -278,6 +289,7 @@ where
         let (sender, certificate_mailbox) =
             mailbox::new_unreliable(context.child("mailbox"), mailbox_capacity);
         let mailbox = Mailbox { sender };
+        let recovery_namespace = cfg.scheme.recovery_namespace();
         let engine = Self {
             context: ContextCell::new(context),
             epoch: cfg.epoch,
@@ -297,6 +309,11 @@ where
             confirmed: BTreeMap::new(),
             rebroadcast_timeout: cfg.rebroadcast_timeout.into(),
             rebroadcast_deadlines: PrioritySet::new(),
+            recovery_after_rebroadcasts: cfg.recovery_after_rebroadcasts.get(),
+            recovery_namespace,
+            recoverer: cfg.recoverer,
+            recovery_ticks: BTreeMap::new(),
+            recovery_requested: BTreeSet::new(),
             journal: None,
             journal_partition: cfg.journal_partition,
             journal_write_buffer: cfg.journal_write_buffer,
@@ -337,8 +354,8 @@ where
             network.0,
             network.1,
         );
-        self.init_journal().await;
-        self.fill_window();
+        let restarted = self.init_journal().await;
+        self.fill_window(restarted);
         let _ = self.metrics.frontier.try_set(self.frontier.get());
         let mut shutdown = self.context.stopped();
         // `select!` is biased, so alternate network and maintenance priority to prevent starvation.
@@ -449,6 +466,7 @@ where
             }
         };
 
+        self.cancel_all_recovery();
         if let Some(journal) = self.journal.take() {
             journal
                 .sync_all()
@@ -458,7 +476,7 @@ where
         outcome
     }
 
-    fn fill_window(&mut self) {
+    fn fill_window(&mut self, recover_immediately: bool) {
         if self.complete {
             return;
         }
@@ -474,7 +492,13 @@ where
             }
             self.pending
                 .insert(position, Pending::Unverified(BTreeMap::new()));
+            self.recovery_ticks.insert(position, 0);
+            self.rebroadcast_deadlines
+                .put(position, self.context.current() + self.rebroadcast_timeout);
             self.request_digest(position);
+            if recover_immediately {
+                self.fetch_recovery(position);
+            }
         }
         debug_assert!(self.pending.len() + self.confirmed.len() <= self.window as usize);
     }
@@ -520,8 +544,6 @@ where
         let Some(ack) = Ack::sign(&self.scheme, Item { position, digest }) else {
             return;
         };
-        self.rebroadcast_deadlines
-            .put(position, self.context.current() + self.rebroadcast_timeout);
         sender.send(Recipients::All, ack.clone(), self.priority_acks);
         self.insert_ack(ack).await;
     }
@@ -608,6 +630,8 @@ where
         self.pending.remove(&position);
         self.digest_aborters.remove(&position);
         self.rebroadcast_deadlines.remove(&position);
+        self.recovery_ticks.remove(&position);
+        self.cancel_recovery(position);
         self.confirmed.insert(position, certificate);
         self.metrics.certificates.inc();
         while self.confirmed.remove(&self.frontier).is_some() {
@@ -619,7 +643,7 @@ where
             self.frontier = self.frontier.next();
         }
         let _ = self.metrics.frontier.try_set(self.frontier.get());
-        self.fill_window();
+        self.fill_window(false);
     }
 
     async fn handle_external_certificate(
@@ -655,18 +679,56 @@ where
         position: Height,
         sender: &mut WrappedSender<impl Sender<PublicKey = <S as Verifier>::PublicKey>, Ack<S, D>>,
     ) {
+        if !self.pending.contains_key(&position) {
+            return;
+        }
+        self.rebroadcast_deadlines
+            .put(position, self.context.current() + self.rebroadcast_timeout);
+        let ticks = self
+            .recovery_ticks
+            .get_mut(&position)
+            .expect("active position missing recovery ticks");
+        *ticks = ticks.saturating_add(1);
+        if *ticks == self.recovery_after_rebroadcasts {
+            self.fetch_recovery(position);
+        }
         let Some(me) = self.scheme.me() else {
             return;
         };
         let Some(Pending::Verified(_, shares)) = self.pending.get(&position) else {
             return;
         };
-        let Some(ack) = shares.get(&me).cloned() else {
-            return;
-        };
-        self.rebroadcast_deadlines
-            .put(position, self.context.current() + self.rebroadcast_timeout);
-        sender.send(Recipients::All, ack, self.priority_acks);
+        if let Some(ack) = shares.get(&me).cloned() {
+            sender.send(Recipients::All, ack, self.priority_acks);
+        }
+    }
+
+    const fn recovery_key(&self, position: Height) -> RecoveryKey {
+        RecoveryKey {
+            namespace: self.recovery_namespace,
+            epoch: self.epoch,
+            position,
+        }
+    }
+
+    fn fetch_recovery(&mut self, position: Height) {
+        let key = self.recovery_key(position);
+        if self.recovery_requested.insert(key) {
+            self.recoverer.fetch(key);
+        }
+    }
+
+    fn cancel_recovery(&mut self, position: Height) {
+        let key = self.recovery_key(position);
+        if self.recovery_requested.remove(&key) {
+            self.recoverer.cancel(key);
+        }
+    }
+
+    fn cancel_all_recovery(&mut self) {
+        for key in std::mem::take(&mut self.recovery_requested) {
+            self.recoverer.cancel(key);
+        }
     }
 
     fn expected_header(&self) -> Header {
@@ -674,6 +736,7 @@ where
         let committee = Sha256::hash(&[JOURNAL_COMMITTEE_DOMAIN, participants.as_ref()]);
         Header {
             version: JOURNAL_VERSION,
+            recovery_namespace: self.recovery_namespace,
             committee,
             epoch: self.epoch,
             first: self.first,
@@ -682,7 +745,7 @@ where
         }
     }
 
-    async fn init_journal(&mut self) {
+    async fn init_journal(&mut self) -> bool {
         let cfg = JournalConfig {
             partition: self.journal_partition.clone(),
             compression: self.journal_compression,
@@ -707,6 +770,10 @@ where
                     assert_eq!(
                         header.version, expected.version,
                         "aggregation journal version mismatch"
+                    );
+                    assert_eq!(
+                        header.recovery_namespace, expected.recovery_namespace,
+                        "aggregation journal namespace digest mismatch"
                     );
                     assert_eq!(
                         header.committee, expected.committee,
@@ -750,12 +817,14 @@ where
             self.journal = Some(journal);
         }
         info!(epoch = %self.epoch, first = %self.first, last = %self.last, frontier = %self.frontier, "replayed aggregation journal");
+        !empty
     }
 
     fn replay_certificate(&mut self, certificate: Certificate<S, D>) {
         // The header does not bind all namespace and threshold-verifier material, so revalidate
         // every certificate.
         let position = certificate.item.position;
+        self.recoverer.cancel(self.recovery_key(position));
         assert_eq!(
             certificate.epoch, self.epoch,
             "journal certificate epoch mismatch"
@@ -813,11 +882,24 @@ where
 mod tests {
     use super::*;
     use crate::{
-        aggregation::scheme::ed25519,
+        aggregation::{Recoverer, scheme::ed25519},
         simplex::mocks::wrapped::{Behavior, Scheme as WrappedScheme},
     };
     use commonware_actor::Feedback;
     use commonware_cryptography::{Sha256, certificate::mocks::Fixture};
+
+    #[derive(Clone)]
+    struct NoopRecoverer;
+
+    impl Recoverer for NoopRecoverer {
+        fn fetch(&mut self, _: RecoveryKey) -> Feedback {
+            Feedback::Ok
+        }
+
+        fn cancel(&mut self, _: RecoveryKey) -> Feedback {
+            Feedback::Ok
+        }
+    }
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
     use commonware_utils::{NZU16, NZUsize, NonZeroDuration};
@@ -888,6 +970,8 @@ mod tests {
                     blocker: NoopBlocker,
                     priority_acks: false,
                     rebroadcast_timeout: NonZeroDuration::new_panic(Duration::from_secs(1)),
+                    recovery_after_rebroadcasts: NonZeroU64::new(1).unwrap(),
+                    recoverer: NoopRecoverer,
                     window: NonZeroU64::new(1).unwrap(),
                     journal_partition: "aggregation-recovery-failure".to_string(),
                     journal_write_buffer: NZUsize!(4096),

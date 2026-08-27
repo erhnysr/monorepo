@@ -19,10 +19,12 @@
 //! scheme from authenticated history. [`Certificate::verify_for`](types::Certificate::verify_for)
 //! checks the epoch and range before verifying the signature.
 //!
-//! This module is the live aggregation core. Resolving certificates missed while offline is a
-//! sibling recovery responsibility. Archiving the complete range and retiring the engine and its
-//! journal are application/orchestrator responsibilities. Recovered certificates enter an active
-//! engine through [`Mailbox`], which applies the same range and signature checks used by recovery.
+//! Active engines can schedule missing certificates through a shared [`RecoveryCoordinator`]. The
+//! coordinator bounds and deduplicates logical resolver requests across engine scopes; it does not
+//! decode, verify, archive, or route certificates. Resolver consumers deliver recovered
+//! certificates through [`Mailbox`], which applies the engine's range and signature checks.
+//! Archiving the complete range and retiring the engine and its journal remain
+//! application/orchestrator responsibilities.
 
 pub mod scheme;
 pub mod types;
@@ -34,6 +36,8 @@ cfg_if::cfg_if! {
         mod engine;
         pub use engine::{CertificateOutcome, Engine, EngineOutcome, Mailbox};
         mod metrics;
+        mod recovery;
+        pub use recovery::{Recoverer, Recovery, RecoveryCoordinator};
 
         #[cfg(test)]
         pub mod mocks;

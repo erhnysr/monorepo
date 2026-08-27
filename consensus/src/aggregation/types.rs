@@ -8,13 +8,15 @@ use crate::{
 use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt, Write};
 use commonware_cryptography::{
-    Digest,
+    Digest, Hasher, Sha256,
     certificate::{
         AssemblyError, Attestation, Namespace as CertificateNamespace, Scheme, Subject,
     },
+    sha256::Digest as Sha256Digest,
 };
 use commonware_parallel::Strategy;
-use commonware_utils::{channel::oneshot, iter::NonEmpty, union};
+use commonware_utils::{Span, channel::oneshot, iter::NonEmpty, union};
+use core::fmt::{self, Display, Formatter};
 use rand_core::CryptoRng;
 use std::hash::Hash;
 
@@ -81,6 +83,12 @@ impl CertificateNamespace for Namespace {
     }
 }
 
+impl Namespace {
+    pub(crate) fn recovery_namespace(&self) -> RecoveryNamespace {
+        RecoveryNamespace::from_signing_namespace(&self.0)
+    }
+}
+
 /// Item represents a single element being aggregated in the protocol.
 /// Each item has a unique position and contains a digest that validators sign.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -89,6 +97,117 @@ pub struct Item<D: Digest> {
     pub position: Height,
     /// Cryptographic digest of the data being aggregated
     pub digest: D,
+}
+
+/// Canonical peer-visible key for an aggregation certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RecoveryKey {
+    /// Canonical aggregation recovery namespace.
+    pub namespace: RecoveryNamespace,
+    /// Epoch whose authenticated scheme verifies the certificate.
+    pub epoch: Epoch,
+    /// Global position within the epoch's authenticated range.
+    pub position: Height,
+}
+
+impl Write for RecoveryKey {
+    fn write(&self, writer: &mut impl BufMut) {
+        self.namespace.write(writer);
+        self.epoch.write(writer);
+        self.position.write(writer);
+    }
+}
+
+impl Read for RecoveryKey {
+    type Cfg = ();
+
+    fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        Ok(Self {
+            namespace: RecoveryNamespace::read(reader)?,
+            epoch: Epoch::read(reader)?,
+            position: Height::read(reader)?,
+        })
+    }
+}
+
+impl EncodeSize for RecoveryKey {
+    fn encode_size(&self) -> usize {
+        self.namespace.encode_size() + self.epoch.encode_size() + self.position.encode_size()
+    }
+}
+
+impl Display for RecoveryKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}/{}", self.namespace, self.epoch, self.position)
+    }
+}
+
+impl Span for RecoveryKey {}
+
+const RECOVERY_NAMESPACE_DOMAIN_V1: &[u8] =
+    b"_COMMONWARE_CONSENSUS_AGGREGATION_RECOVERY_NAMESPACE_V1";
+
+/// Durable version-1 identity for an aggregation application namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RecoveryNamespace(Sha256Digest);
+
+impl RecoveryNamespace {
+    /// Derives a recovery namespace from the exact application namespace bytes supplied when
+    /// constructing the aggregation signing scheme.
+    ///
+    /// Using different bytes for the scheme and recovery namespace partitions recovery and is an
+    /// application correctness fault.
+    pub fn derive(namespace: &[u8]) -> Self {
+        Self::from_signing_namespace(&ack_namespace(namespace))
+    }
+
+    fn from_signing_namespace(namespace: &[u8]) -> Self {
+        Self(Sha256::hash(&[RECOVERY_NAMESPACE_DOMAIN_V1, namespace]))
+    }
+}
+
+impl Write for RecoveryNamespace {
+    fn write(&self, writer: &mut impl BufMut) {
+        self.0.write(writer);
+    }
+}
+
+impl Read for RecoveryNamespace {
+    type Cfg = ();
+
+    fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        Ok(Self(Sha256Digest::read(reader)?))
+    }
+}
+
+impl EncodeSize for RecoveryNamespace {
+    fn encode_size(&self) -> usize {
+        self.0.encode_size()
+    }
+}
+
+impl Display for RecoveryNamespace {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> arbitrary::Arbitrary<'a> for RecoveryNamespace {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self(u.arbitrary()?))
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> arbitrary::Arbitrary<'a> for RecoveryKey {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self {
+            namespace: u.arbitrary()?,
+            epoch: u.arbitrary()?,
+            position: u.arbitrary()?,
+        })
+    }
 }
 
 impl<D: Digest> Heightable for Item<D> {
@@ -461,6 +580,8 @@ mod tests {
         type Scheme = bls12381_threshold::Scheme<PublicKey, MinSig>;
 
         commonware_conformance::conformance_tests! {
+            CodecConformance<RecoveryNamespace>,
+            CodecConformance<RecoveryKey>,
             CodecConformance<Item<Sha256Digest>>,
             CodecConformance<Ack<Scheme, Sha256Digest>>,
             CodecConformance<Certificate<Scheme, Sha256Digest>>,

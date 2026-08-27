@@ -1,4 +1,4 @@
-use super::{scheme, types::Certificate};
+use super::{Recoverer, scheme, types::Certificate};
 use crate::{
     Automaton, Reporter,
     types::{Epoch, Height},
@@ -18,6 +18,7 @@ pub struct Config<
     Z: Reporter<Activity = Certificate<S, D>>,
     B: Blocker<PublicKey = <S as Verifier>::PublicKey>,
     T: Strategy,
+    R: Recoverer,
 > {
     /// Epoch represented by this engine.
     pub epoch: Epoch,
@@ -43,6 +44,10 @@ pub struct Config<
     pub priority_acks: bool,
     /// How often an acknowledgment is rebroadcast until certification.
     pub rebroadcast_timeout: NonZeroDuration,
+    /// Number of acknowledgment rebroadcast ticks before resolver recovery starts.
+    pub recovery_after_rebroadcasts: NonZeroU64,
+    /// Shared resolver recovery coordinator.
+    pub recoverer: R,
     /// Maximum number of live positions.
     ///
     /// This value must remain unchanged while retaining the engine's journal.

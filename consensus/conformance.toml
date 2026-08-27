@@ -10,6 +10,14 @@ hash = "1cc057914de5688dec8228c0ba788b74f00f2e6d11c5371eeedf0c025b330a73"
 n_cases = 65536
 hash = "55b287b5530fc9ba77c45ec5030ada38f86b2ddf66a1595fde27d4699667b1a3"
 
+["commonware_consensus::aggregation::types::tests::conformance::CodecConformance<RecoveryKey>"]
+n_cases = 65536
+hash = "828c322acd71f3adf7d6bba9328eb5082d5c1f89bbaeec8069b1f47206c42ddc"
+
+["commonware_consensus::aggregation::types::tests::conformance::CodecConformance<RecoveryNamespace>"]
+n_cases = 65536
+hash = "d65ced18cacd65769e8f9732131a06216e6600d5a115c4ed7483a8530813ddcd"
+
 ["commonware_consensus::marshal::coding::types::test::conformance::CodecConformance<Shard<ReedSolomon<Sha256>,Sha256>>"]
 n_cases = 65536
 hash = "e53b4b684f0344590427aae976d298e3b6fd2b08ef46ff2cad5def04b4f7690b"

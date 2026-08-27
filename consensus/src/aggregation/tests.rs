@@ -1,13 +1,14 @@
 use super::{
-    CertificateOutcome, Config, Engine, EngineOutcome,
+    CertificateOutcome, Config, Engine, EngineOutcome, Recoverer,
     scheme::{self, Scheme},
-    types::{Ack, Certificate, Item},
+    types::{Ack, Certificate, Item, RecoveryKey, RecoveryNamespace},
 };
 use crate::{
     Automaton, Reporter,
     types::{Epoch, Height},
 };
 use commonware_actor::Feedback;
+use commonware_codec::Encode;
 use commonware_cryptography::{
     Hasher, Sha256,
     certificate::{Scheme as _, mocks::Fixture},
@@ -15,7 +16,7 @@ use commonware_cryptography::{
     sha256::Digest as Sha256Digest,
 };
 use commonware_macros::test_traced;
-use commonware_p2p::{Message, Receiver as P2pReceiver};
+use commonware_p2p::{Message, Receiver as P2pReceiver, Recipients, Sender as _};
 use commonware_p2p::simulated::{Control, Link, Network, Oracle, Receiver, Sender};
 use commonware_parallel::Sequential;
 use commonware_runtime::{
@@ -240,6 +241,23 @@ struct EngineScope {
     window: u64,
 }
 
+#[derive(Clone, Default)]
+struct RecordingRecoverer {
+    events: Arc<Mutex<Vec<(bool, RecoveryKey)>>>,
+}
+
+impl Recoverer for RecordingRecoverer {
+    fn fetch(&mut self, key: RecoveryKey) -> Feedback {
+        self.events.lock().push((true, key));
+        Feedback::Ok
+    }
+
+    fn cancel(&mut self, key: RecoveryKey) -> Feedback {
+        self.events.lock().push((false, key));
+        Feedback::Ok
+    }
+}
+
 fn config<S, A>(
     context: &Context,
     scheme: S,
@@ -247,7 +265,15 @@ fn config<S, A>(
     reporter: RecordingReporter<S>,
     blocker: Control<PublicKey, Context>,
     scope: EngineScope,
-) -> Config<S, Sha256Digest, A, RecordingReporter<S>, Control<PublicKey, Context>, Sequential>
+) -> Config<
+    S,
+    Sha256Digest,
+    A,
+    RecordingReporter<S>,
+    Control<PublicKey, Context>,
+    Sequential,
+    RecordingRecoverer,
+>
 where
     S: Scheme<Sha256Digest, PublicKey = PublicKey>,
     A: Automaton<Context = Height, Digest = Sha256Digest>,
@@ -262,6 +288,8 @@ where
         blocker,
         priority_acks: false,
         rebroadcast_timeout: NonZeroDuration::new_panic(Duration::from_millis(50)),
+        recovery_after_rebroadcasts: NonZeroU64::new(3).unwrap(),
+        recoverer: RecordingRecoverer::default(),
         window: NonZeroU64::new(scope.window).unwrap(),
         journal_partition: scope.partition,
         journal_write_buffer: NZUsize!(4096),
@@ -542,6 +570,152 @@ fn test_certificate_ingress_cancels_digest() {
 }
 
 #[test_traced("INFO")]
+fn test_recovery_threshold_cancellation_and_window_bound() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 4);
+        let epoch = Epoch::new(90);
+        let first = Height::new(500);
+        let second = first.next();
+        let third = second.next();
+        let participant = fixture.participants[0].clone();
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, false).await;
+        let application = ClosedApplication::default();
+        let requested = application.requested.clone();
+        let recoverer = RecordingRecoverer::default();
+        let events = recoverer.events.clone();
+        let mut cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            application,
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: "aggregation-recovery-window".into(),
+                epoch,
+                first,
+                last: third,
+                window: 2,
+            },
+        );
+        cfg.recovery_after_rebroadcasts = NonZeroU64::new(2).unwrap();
+        cfg.recoverer = recoverer;
+        let (engine, mut mailbox) = Engine::new(context.child("engine"), cfg);
+        let handle = engine.start(registrations.remove(&participant).unwrap());
+
+        while requested.lock().len() < 2 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(requested.lock().as_slice(), &[first, second]);
+        context.sleep(Duration::from_millis(99)).await;
+        assert!(events.lock().is_empty());
+        context.sleep(Duration::from_millis(2)).await;
+        assert_eq!(
+            events.lock().clone(),
+            vec![
+                (
+                    true,
+                    RecoveryKey {
+                        namespace: RecoveryNamespace::derive(NAMESPACE),
+                        epoch,
+                        position: first,
+                    },
+                ),
+                (
+                    true,
+                    RecoveryKey {
+                        namespace: RecoveryNamespace::derive(NAMESPACE),
+                        epoch,
+                        position: second,
+                    },
+                ),
+            ]
+        );
+
+        assert_eq!(
+            mailbox.submit(certificate(&fixture, epoch, first)).await,
+            CertificateOutcome::Accepted
+        );
+        while requested.lock().len() < 3 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(events.lock().iter().filter(|(fetch, _)| *fetch).count(), 2);
+        context.sleep(Duration::from_millis(101)).await;
+        assert_eq!(events.lock().iter().filter(|(fetch, _)| *fetch).count(), 3);
+
+        for position in [second, third] {
+            assert_eq!(
+                mailbox.submit(certificate(&fixture, epoch, position)).await,
+                CertificateOutcome::Accepted
+            );
+        }
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Completed
+        );
+        let events = events.lock();
+        assert_eq!(events.iter().filter(|(fetch, _)| *fetch).count(), 3);
+        assert_eq!(events.iter().filter(|(fetch, _)| !*fetch).count(), 3);
+    });
+}
+
+#[test_traced("INFO")]
+fn test_locally_assembled_certificate_cancels_recovery() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 4);
+        let epoch = Epoch::new(91);
+        let position = Height::new(510);
+        let participant = fixture.participants[0].clone();
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, true).await;
+        let recoverer = RecordingRecoverer::default();
+        let events = recoverer.events.clone();
+        let mut cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            ImmediateApplication::default(),
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: "aggregation-local-recovery-cancel".into(),
+                epoch,
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        cfg.recovery_after_rebroadcasts = NonZeroU64::new(1).unwrap();
+        cfg.recoverer = recoverer;
+        let (engine, _mailbox) = Engine::new(context.child("engine"), cfg);
+        let handle = engine.start(registrations.remove(&participant).unwrap());
+
+        while events.lock().is_empty() {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        let item = Item {
+            position,
+            digest: digest(position),
+        };
+        for index in 1..3 {
+            let peer = fixture.participants[index].clone();
+            let (mut sender, _) = registrations.remove(&peer).unwrap();
+            let ack = Ack::sign(&fixture.schemes[index], item.clone()).unwrap();
+            sender.send(Recipients::One(participant.clone()), ack.encode(), false);
+        }
+
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Completed
+        );
+        let events = events.lock();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].0);
+        assert!(!events[1].0);
+        assert_eq!(events[0].1, events[1].1);
+    });
+}
+
+#[test_traced("INFO")]
 fn test_closed_proposal_response_is_terminal() {
     deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
         let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 4);
@@ -746,7 +920,7 @@ fn test_restart_reproposes_uncertified_position() {
 
         let first_application = PendingApplication::default();
         let first_requests = first_application.requested.clone();
-        let first_cfg = config(
+        let mut first_cfg = config(
             &context,
             fixture.schemes[0].clone(),
             first_application,
@@ -760,6 +934,7 @@ fn test_restart_reproposes_uncertified_position() {
                 window: 1,
             },
         );
+        first_cfg.recovery_after_rebroadcasts = NonZeroU64::new(u64::MAX).unwrap();
         let (first_engine, _mailbox) = Engine::new(context.child("first_engine"), first_cfg);
         let first_handle = first_engine.start(registrations.remove(&participant).unwrap());
 
@@ -786,7 +961,9 @@ fn test_restart_reproposes_uncertified_position() {
 
         let restart_application = PendingApplication::default();
         let restart_requests = restart_application.requested.clone();
-        let restart_cfg = config(
+        let restart_recoverer = RecordingRecoverer::default();
+        let restart_events = restart_recoverer.events.clone();
+        let mut restart_cfg = config(
             &context,
             fixture.schemes[0].clone(),
             restart_application,
@@ -800,6 +977,8 @@ fn test_restart_reproposes_uncertified_position() {
                 window: 1,
             },
         );
+        restart_cfg.recovery_after_rebroadcasts = NonZeroU64::new(u64::MAX).unwrap();
+        restart_cfg.recoverer = restart_recoverer;
         let (restart_engine, _mailbox) =
             Engine::new(context.child("restart_engine"), restart_cfg);
         let restart_handle = restart_engine.start(restart_registration);
@@ -807,6 +986,20 @@ fn test_restart_reproposes_uncertified_position() {
         while !restart_requests.lock().contains_key(&position) {
             context.sleep(Duration::from_millis(1)).await;
         }
+        while restart_events.lock().is_empty() {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            restart_events.lock().as_slice(),
+            &[ (
+                true,
+                RecoveryKey {
+                    namespace: RecoveryNamespace::derive(NAMESPACE),
+                    epoch,
+                    position,
+                },
+            ) ]
+        );
         let _replacement = oracle
             .control(participant)
             .register(0, QUOTA)
@@ -818,6 +1011,8 @@ fn test_restart_reproposes_uncertified_position() {
                 .expect("restarted aggregation engine failed"),
             EngineOutcome::Stopped
         );
+        assert_eq!(restart_events.lock().len(), 2);
+        assert!(!restart_events.lock()[1].0);
     });
 }
 
@@ -964,7 +1159,9 @@ fn test_journal_replay_resumes_partial_mid_range() {
         let replay_requests = replay_application.requested.clone();
         let replay_reporter = RecordingReporter::default();
         let replay_certificates = replay_reporter.certificates.clone();
-        let replay_cfg = config(
+        let replay_recoverer = RecordingRecoverer::default();
+        let replay_events = replay_recoverer.events.clone();
+        let mut replay_cfg = config(
             &context,
             fixture.schemes[0].clone(),
             replay_application,
@@ -978,6 +1175,7 @@ fn test_journal_replay_resumes_partial_mid_range() {
                 window: 6,
             },
         );
+        replay_cfg.recoverer = replay_recoverer;
         let (replay_engine, _mailbox) = Engine::new(context.child("replay_engine"), replay_cfg);
         assert_eq!(
             replay_engine
@@ -991,6 +1189,15 @@ fn test_journal_replay_resumes_partial_mid_range() {
         assert_eq!(requested.len(), 4);
         assert!(!requested.contains(&Height::new(122)));
         assert!(!requested.contains(&Height::new(123)));
+        let recovered: BTreeSet<_> = replay_events
+            .lock()
+            .iter()
+            .filter_map(|(fetch, key)| fetch.then_some(key.position))
+            .collect();
+        assert_eq!(
+            recovered,
+            [120, 121, 124, 125].into_iter().map(Height::new).collect()
+        );
         let certified: BTreeSet<_> = replay_certificates
             .lock()
             .iter()
@@ -1064,7 +1271,7 @@ fn journal_namespace_mismatch() {
 }
 
 #[test_traced("INFO")]
-#[should_panic(expected = "journal certificate signature mismatch")]
+#[should_panic(expected = "aggregation journal namespace digest mismatch")]
 fn test_journal_rejects_signing_namespace_mismatch() {
     journal_namespace_mismatch();
 }
