@@ -33,6 +33,7 @@ use commonware_utils::{
     PrioritySet,
     channel::{fallible::OneshotExt, oneshot},
     futures::{AbortablePool as FuturesPool, Aborter, rebind},
+    non_empty,
     ordered::Quorum,
 };
 use futures::future::{self, Either};
@@ -579,11 +580,13 @@ where
         if matching.len() < quorum {
             return true;
         }
-        let Some(certificate) =
-            Certificate::from_acks(&self.scheme, self.epoch, matching, &self.strategy)
-        else {
-            return false;
-        };
+        let certificate = Certificate::from_acks(
+            &self.scheme,
+            self.epoch,
+            non_empty![@matching],
+            &self.strategy,
+        )
+        .expect("verified signer-unique quorum must assemble");
         self.accept_certificate(certificate).await;
         true
     }
@@ -803,5 +806,111 @@ where
         rebind(&mut self.journal, |journal| journal.sync(section))
             .await
             .expect("unable to sync aggregation journal");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        aggregation::scheme::ed25519,
+        simplex::mocks::wrapped::{Behavior, Scheme as WrappedScheme},
+    };
+    use commonware_actor::Feedback;
+    use commonware_cryptography::{Sha256, certificate::mocks::Fixture};
+    use commonware_parallel::Sequential;
+    use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+    use commonware_utils::{NZU16, NZUsize, NonZeroDuration};
+
+    #[derive(Clone)]
+    struct NoopAutomaton;
+
+    impl Automaton for NoopAutomaton {
+        type Context = Height;
+        type Digest = <Sha256 as Hasher>::Digest;
+
+        async fn propose(&mut self, _context: Height) -> oneshot::Receiver<Self::Digest> {
+            oneshot::channel().1
+        }
+
+        async fn verify(
+            &mut self,
+            _context: Height,
+            _digest: Self::Digest,
+        ) -> oneshot::Receiver<bool> {
+            oneshot::channel().1
+        }
+    }
+
+    #[derive(Clone)]
+    struct NoopReporter<S: commonware_cryptography::certificate::Scheme>(
+        std::marker::PhantomData<S>,
+    );
+
+    impl<S: commonware_cryptography::certificate::Scheme> Reporter for NoopReporter<S> {
+        type Activity = Certificate<S, <Sha256 as Hasher>::Digest>;
+
+        fn report(&mut self, _activity: Self::Activity) -> Feedback {
+            Feedback::Ok
+        }
+    }
+
+    #[derive(Clone)]
+    struct NoopBlocker;
+
+    impl Blocker for NoopBlocker {
+        type PublicKey = commonware_cryptography::ed25519::PublicKey;
+
+        fn block(&mut self, _peer: Self::PublicKey) -> Feedback {
+            Feedback::Ok
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "verified signer-unique quorum must assemble")]
+    fn assembly_failure_panics() {
+        deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+            let Fixture { schemes, .. } =
+                ed25519::fixture(&mut context, b"aggregation-recovery-failure", 4);
+            let epoch = Epoch::new(111);
+            let position = Height::new(0);
+            let digest = Sha256::hash(&[b"payload"]);
+            let scheme = WrappedScheme::new(schemes[0].clone(), Behavior::RecoveryFailure);
+            let (mut engine, _) = Engine::new(
+                context.child("engine"),
+                Config {
+                    epoch,
+                    first: position,
+                    last: position,
+                    scheme,
+                    automaton: NoopAutomaton,
+                    reporter: NoopReporter(std::marker::PhantomData),
+                    blocker: NoopBlocker,
+                    priority_acks: false,
+                    rebroadcast_timeout: NonZeroDuration::new_panic(Duration::from_secs(1)),
+                    window: NonZeroU64::new(1).unwrap(),
+                    journal_partition: "aggregation-recovery-failure".to_string(),
+                    journal_write_buffer: NZUsize!(4096),
+                    journal_replay_buffer: NZUsize!(4096),
+                    journal_heights_per_section: NonZeroU64::new(4).unwrap(),
+                    journal_compression: None,
+                    journal_page_cache: CacheRef::from_pooler(
+                        &context,
+                        NZU16!(1024),
+                        NZUsize!(10),
+                    ),
+                    strategy: Sequential,
+                },
+            );
+            engine
+                .pending
+                .insert(position, Pending::Verified(digest, BTreeMap::new()));
+
+            for scheme in schemes.iter().take(3) {
+                let scheme = WrappedScheme::new(scheme.clone(), Behavior::Honest);
+                let ack = Ack::sign(&scheme, Item { position, digest }).unwrap();
+                assert!(engine.insert_ack(ack).await);
+            }
+        });
     }
 }

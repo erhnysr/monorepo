@@ -24,7 +24,8 @@ use commonware_runtime::{
     deterministic::{self, Context},
 };
 use commonware_utils::{
-    NZU16, NZUsize, NonZeroDuration, channel::oneshot, ordered::Quorum, probability, sync::Mutex,
+    NZU16, NZUsize, NonZeroDuration, channel::oneshot, non_empty, ordered::Quorum, probability,
+    sync::Mutex,
 };
 use futures::future::join_all;
 use std::{
@@ -291,7 +292,13 @@ where
         .take(quorum)
         .map(|scheme| Ack::sign(scheme, item.clone()).unwrap())
         .collect();
-    Certificate::from_acks(&fixture.schemes[0], epoch, &acks, &Sequential).unwrap()
+    Certificate::from_acks(
+        &fixture.schemes[0],
+        epoch,
+        non_empty![@acks.iter()],
+        &Sequential,
+    )
+    .unwrap()
 }
 
 fn all_online<S, F>(fixture: F)
@@ -492,8 +499,13 @@ where
             .take(quorum)
             .map(|scheme| Ack::sign(scheme, item.clone()).unwrap())
             .collect();
-        let certificate =
-            Certificate::from_acks(&fixture.schemes[0], epoch, &acks, &Sequential).unwrap();
+        let certificate = Certificate::from_acks(
+            &fixture.schemes[0],
+            epoch,
+            non_empty![@acks.iter()],
+            &Sequential,
+        )
+        .unwrap();
 
         let mut wrong_epoch = certificate.clone();
         wrong_epoch.epoch = epoch.next();
@@ -616,7 +628,7 @@ fn test_certificate_ingress_is_bounded() {
         let certificate = Certificate::from_acks(
             &fixture.schemes[0],
             epoch,
-            &acks,
+            non_empty![@acks.iter()],
             &Sequential,
         )
         .unwrap();
