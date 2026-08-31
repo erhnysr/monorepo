@@ -26,8 +26,7 @@ use thiserror::Error;
 pub enum Outcome {
     /// The epoch still has missing certificates or lacks cleanup authorization.
     Parked {
-        /// Whether every certificate in the retained journal has been verified
-        /// and submitted to durable history.
+        /// Whether all certificates in the retained journal are durable in history.
         journal_archived: bool,
     },
     /// Durable history is complete and the exact journal was destroyed.

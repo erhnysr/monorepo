@@ -1,10 +1,12 @@
 //! Recover certificates for every position in a fixed per-epoch range.
 //!
 //! Each [`Engine`] has one immutable epoch, inclusive global position range, and signing scheme.
-//! The signing scheme is the sole source of the application namespace. The engine requests and
-//! signs every position in that range. The application must return the same digest for a position
-//! across clones and restarts. Shares are not durable; after restart, the engine requests the
-//! canonical digest and signs it again. Certificates are journaled and synced before reporting.
+//! The signing scheme is the sole source of the application namespace. The engine requests every
+//! position in its range and signs when its scheme contains a local share. A verifier-only engine
+//! can collect shares and recover certificates without signing. The application must return the
+//! same digest for a position across clones and restarts. Shares are not durable; after restart, a
+//! signing engine requests the canonical digest and signs it again. Certificates are journaled and
+//! synced before reporting.
 //! The engine keeps a bounded window anchored at the lowest uncertified position. It returns
 //! `Completed` only after the entire range is certified; shutdown returns `Stopped`. A durable
 //! header binds the journal to its committee, epoch, range, and window. Replay revalidates each

@@ -2,15 +2,14 @@
 //!
 //! Certificates are immutable and indexed by their global [`Height`]. Resolver
 //! responses and locally recovered certificates enter through the same bounded
-//! mailbox. Work rejected under backpressure must be retried. A successful response is an
-//! explicit durability barrier:
-//! it is sent only after the archive has synced.
+//! mailbox. Work rejected under backpressure must be retried. A successful response
+//! is sent only after the archive has synced.
 //!
 //! Retirement first syncs and semantically verifies every certificate in the
 //! authenticated epoch range. It then atomically persists an exact range marker
 //! and journal-cleanup intent. The intent survives a crash until the application
 //! confirms journal removal, at which point the discovery floor may advance.
-//! This module deliberately does not guess how a private journal is named or stored.
+//! This module does not determine how a private journal is named or stored.
 
 use bytes::{Buf, BufMut, Bytes};
 use commonware_actor::{
