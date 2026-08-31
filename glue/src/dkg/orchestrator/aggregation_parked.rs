@@ -25,7 +25,11 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outcome {
     /// The epoch still has missing certificates or lacks cleanup authorization.
-    Parked,
+    Parked {
+        /// Whether every certificate in the retained journal has been verified
+        /// and submitted to durable history.
+        journal_archived: bool,
+    },
     /// Durable history is complete and the exact journal was destroyed.
     Retired,
 }
@@ -75,6 +79,7 @@ pub async fn recover<E, S, D, P, V, R, T>(
     history: &mut Handler,
     recoverer: &mut R,
     missing_batch: NonZeroUsize,
+    journal_archived: bool,
 ) -> Result<Outcome, Error>
 where
     E: Storage + Metrics,
@@ -93,34 +98,50 @@ where
         return Err(Error::RangeMismatch);
     }
 
-    let (journal, certificates) =
-        Journal::<E, S, D>::init(storage, journal_config, verifier, scheme, strategy).await?;
-    let identity = journal.identity();
     let retirement = Retirement {
         namespace: identity.namespace,
         epoch: identity.epoch,
         first: identity.first,
         last: identity.last,
     };
-
-    for certificate in certificates {
-        let position = certificate.item.position;
-        let key = RecoveryKey {
-            namespace: retirement.namespace,
-            epoch: retirement.epoch,
-            position,
-        };
-        match history.archive(key, certificate.encode()).await {
-            Ok(ArchiveStatus::Stored | ArchiveStatus::Duplicate) => {}
-            Ok(ArchiveStatus::Rejected) => return Err(Error::HistoryRejected(position)),
-            Err(RequestError::Backpressured) => return Err(Error::HistoryBackpressured),
-            Err(RequestError::Closed) => return Err(Error::HistoryUnavailable),
+    let mut storage = Some(storage);
+    let mut journal_config = Some(journal_config);
+    let mut journal = None;
+    let mut journal_archived = journal_archived;
+    if !journal_archived {
+        let (opened, certificates) = Journal::<E, S, D>::init(
+            storage.take().expect("journal storage missing"),
+            journal_config.take().expect("journal config missing"),
+            verifier,
+            scheme,
+            strategy,
+        )
+        .await?;
+        for certificate in certificates {
+            let position = certificate.item.position;
+            let key = RecoveryKey {
+                namespace: retirement.namespace,
+                epoch: retirement.epoch,
+                position,
+            };
+            match history.archive(key, certificate.encode()).await {
+                Ok(ArchiveStatus::Stored | ArchiveStatus::Duplicate) => {}
+                Ok(ArchiveStatus::Rejected) => return Err(Error::HistoryRejected(position)),
+                Err(RequestError::Backpressured) => {
+                    return Ok(Outcome::Parked {
+                        journal_archived: false,
+                    });
+                }
+                Err(RequestError::Closed) => return Err(Error::HistoryUnavailable),
+            }
         }
+        journal = Some(opened);
+        journal_archived = true;
     }
 
     let missing = match history.missing(retirement, missing_batch).await {
         Ok(missing) => missing,
-        Err(RequestError::Backpressured) => return Err(Error::HistoryBackpressured),
+        Err(RequestError::Backpressured) => return Ok(Outcome::Parked { journal_archived }),
         Err(RequestError::Closed) => return Err(Error::HistoryUnavailable),
     };
     if !missing.is_empty() {
@@ -137,18 +158,32 @@ where
                 Unreliable::Outcome(_) | Unreliable::Rejected => {}
             }
         }
-        return Ok(Outcome::Parked);
+        return Ok(Outcome::Parked { journal_archived });
     }
 
     let cleanup = match history.retire(retirement).await {
         Ok(cleanup) => cleanup,
-        Err(RequestError::Backpressured) => return Err(Error::HistoryBackpressured),
+        Err(RequestError::Backpressured) => return Ok(Outcome::Parked { journal_archived }),
         Err(RequestError::Closed) => return Err(Error::HistoryUnavailable),
     };
     match cleanup {
         Some(Cleanup {
             retirement: authorized,
         }) if authorized == retirement => {
+            let journal = match journal {
+                Some(journal) => journal,
+                None => {
+                    Journal::<E, S, D>::init(
+                        storage.take().expect("journal storage missing"),
+                        journal_config.take().expect("journal config missing"),
+                        verifier,
+                        scheme,
+                        strategy,
+                    )
+                    .await?
+                    .0
+                }
+            };
             journal.destroy().await?;
             match history.cleanup_complete(retirement).await {
                 Ok(true) => Ok(Outcome::Retired),
@@ -158,7 +193,7 @@ where
             }
         }
         Some(_) => Err(Error::CleanupMismatch),
-        None => Ok(Outcome::Parked),
+        None => Ok(Outcome::Parked { journal_archived }),
     }
 }
 
@@ -413,10 +448,13 @@ mod tests {
                     &mut history,
                     &mut recoverer,
                     NZUsize!(2),
+                    false,
                 )
                 .await
                 .unwrap(),
-                Outcome::Parked
+                Outcome::Parked {
+                    journal_archived: true
+                }
             );
             assert_eq!(
                 requests.lock().as_slice(),
@@ -507,6 +545,7 @@ mod tests {
                     &mut history,
                     &mut RecordingRecoverer::default(),
                     NZUsize!(1),
+                    false,
                 )
                 .await
                 .unwrap(),
@@ -585,6 +624,7 @@ mod tests {
                     &mut handler,
                     &mut RecordingRecoverer::default(),
                     NZUsize!(1),
+                    false,
                 )
                 .await,
                 Err(Error::UnknownEpoch)
@@ -602,6 +642,7 @@ mod tests {
                     &mut handler,
                     &mut RecordingRecoverer::default(),
                     NZUsize!(1),
+                    false,
                 )
                 .await,
                 Err(Error::RangeMismatch)
@@ -651,6 +692,7 @@ mod tests {
                     &mut closed_history,
                     &mut RecordingRecoverer::default(),
                     NZUsize!(1),
+                    false,
                 )
                 .await,
                 Err(Error::HistoryUnavailable)
@@ -689,6 +731,7 @@ mod tests {
                     &mut history,
                     &mut ClosedRecoverer,
                     NZUsize!(1),
+                    false,
                 )
                 .await,
                 Err(Error::RecovererClosed)

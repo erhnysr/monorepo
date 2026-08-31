@@ -49,9 +49,12 @@ use commonware_utils::{
     sync::Mutex,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::{
     collections::{BTreeMap, HashMap},
-    fs,
+    fs::{self, File, OpenOptions},
+    io::Write as _,
     num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     sync::Arc,
@@ -348,6 +351,7 @@ impl DynamicProvider<AggregationScheme> {
         sharing: Sharing<MinSig>,
         share: Option<Share>,
     ) -> anyhow::Result<()> {
+        let is_verifier = share.is_none();
         let scheme = match share {
             Some(share) => AggregationScheme::signer(
                 AGGREGATION_NAMESPACE,
@@ -365,7 +369,37 @@ impl DynamicProvider<AggregationScheme> {
         if let Some(store) = &self.descriptors {
             store.put_descriptor(epoch, &participants, &sharing)?;
         }
-        self.register(epoch, scheme);
+        let mut schemes = self.schemes.lock();
+        if is_verifier
+            && schemes
+                .get(&epoch)
+                .is_some_and(|existing| existing.share().is_some())
+        {
+            return Ok(());
+        }
+        schemes.insert(epoch, Arc::new(scheme));
+        Ok(())
+    }
+
+    fn erase_private_before(&self, min: Epoch) -> anyhow::Result<()> {
+        let Some(store) = &self.descriptors else {
+            anyhow::bail!("aggregation provider has no durable descriptor store");
+        };
+        let replacements = store
+            .descriptors()
+            .into_iter()
+            .filter(|(epoch, _)| *epoch < min)
+            .map(|(epoch, descriptor)| Ok((epoch, descriptor.scheme(epoch, None)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut schemes = self.schemes.lock();
+        for (epoch, verifier) in replacements {
+            if schemes
+                .get(&epoch)
+                .is_some_and(|scheme| scheme.share().is_some())
+            {
+                schemes.insert(epoch, Arc::new(verifier));
+            }
+        }
         Ok(())
     }
 
@@ -521,6 +555,7 @@ pub struct RetainedSecretStore {
     inner: FileSecretStore,
     history: commonware_glue::dkg::orchestrator::aggregation::Handler,
     namespace: aggregation::types::RecoveryNamespace,
+    provider: DynamicProvider<AggregationScheme>,
 }
 
 impl RetainedSecretStore {
@@ -529,11 +564,13 @@ impl RetainedSecretStore {
         inner: FileSecretStore,
         history: commonware_glue::dkg::orchestrator::aggregation::Handler,
         namespace: aggregation::types::RecoveryNamespace,
+        provider: DynamicProvider<AggregationScheme>,
     ) -> Self {
         Self {
             inner,
             history,
             namespace,
+            provider,
         }
     }
 }
@@ -592,6 +629,16 @@ impl FileSecretStore {
     /// Open the store at `path`, starting empty if the file does not exist.
     pub fn load(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let path = path.into();
+        let _lock = SecretStoreLock::acquire(&path)?;
+        let temp = secret_temp_path(&path)?;
+        if temp.exists() {
+            fs::remove_file(&temp)?;
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            sync_directory(parent)?;
+        }
         let inner = if path.exists() {
             let contents = fs::read_to_string(&path)?;
             serde_json::from_str(&contents)?
@@ -606,20 +653,58 @@ impl FileSecretStore {
 
     /// Seed the store with a trusted-setup share for `epoch`.
     pub fn put_initial_share(&self, epoch: Epoch, share: Share) -> anyhow::Result<()> {
-        self.inner
-            .lock()
-            .shares
-            .insert(epoch.get(), hex(&share.encode()));
-        self.flush()
+        self.update(|inner| {
+            inner.shares.insert(epoch.get(), hex(&share.encode()));
+            Ok(())
+        })
     }
 
-    fn flush(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let contents = serde_json::to_string_pretty(&*self.inner.lock())?;
-        fs::write(&self.path, contents)?;
+    fn update(
+        &self,
+        mutate: impl FnOnce(&mut SecretData) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let _lock = SecretStoreLock::acquire(&self.path)?;
+        let mut inner = self.inner.lock();
+        let mut next = if self.path.exists() {
+            serde_json::from_str(&fs::read_to_string(&self.path)?)?
+        } else {
+            inner.clone()
+        };
+        mutate(&mut next)?;
+        self.flush(&next)?;
+        *inner = next;
         Ok(())
+    }
+
+    fn flush(&self, data: &SecretData) -> anyhow::Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let temp = secret_temp_path(&self.path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp)?;
+        #[cfg(unix)]
+        if let Ok(metadata) = fs::metadata(&self.path) {
+            file.set_permissions(fs::Permissions::from_mode(metadata.permissions().mode()))?;
+        }
+        let result = (|| {
+            serde_json::to_writer_pretty(&mut file, data)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::rename(&temp, &self.path)?;
+            sync_directory(parent)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
     }
 
     fn put_descriptor(
@@ -632,17 +717,17 @@ impl FileSecretStore {
             participants: hex(&participants.encode()),
             sharing: hex(&sharing.encode()),
         };
-        let mut inner = self.inner.lock();
-        if inner
-            .aggregation_epochs
-            .get(&epoch.get())
-            .is_some_and(|existing| existing != &descriptor)
-        {
-            anyhow::bail!("refusing to replace aggregation epoch {epoch}");
-        }
-        inner.aggregation_epochs.insert(epoch.get(), descriptor);
-        drop(inner);
-        self.flush()
+        self.update(|inner| {
+            if inner
+                .aggregation_epochs
+                .get(&epoch.get())
+                .is_some_and(|existing| existing != &descriptor)
+            {
+                anyhow::bail!("refusing to replace aggregation epoch {epoch}");
+            }
+            inner.aggregation_epochs.insert(epoch.get(), descriptor);
+            Ok(())
+        })
     }
 
     fn descriptors(&self) -> Vec<(Epoch, AggregationEpochDescriptor)> {
@@ -659,14 +744,14 @@ impl FileSecretStore {
     }
 
     fn set_aggregation_floor(&self, epoch: Epoch) -> anyhow::Result<()> {
-        let mut inner = self.inner.lock();
-        inner.aggregation_floor = Some(
-            inner
-                .aggregation_floor
-                .map_or(epoch.get(), |floor| floor.max(epoch.get())),
-        );
-        drop(inner);
-        self.flush()
+        self.update(|inner| {
+            inner.aggregation_floor = Some(
+                inner
+                    .aggregation_floor
+                    .map_or(epoch.get(), |floor| floor.max(epoch.get())),
+            );
+            Ok(())
+        })
     }
 
     fn share(&self, epoch: Epoch) -> anyhow::Result<Option<Share>> {
@@ -682,13 +767,55 @@ impl FileSecretStore {
     }
 }
 
+struct SecretStoreLock(File);
+
+impl SecretStoreLock {
+    fn acquire(path: &Path) -> anyhow::Result<Self> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("secret store path has no file name"))?
+            .to_string_lossy();
+        let lock_path = parent.join(format!(".{file_name}.lock"));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(lock_path)?;
+        file.lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for SecretStoreLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn secret_temp_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("secret store path has no file name"))?
+        .to_string_lossy();
+    Ok(parent.join(format!(".{file_name}.tmp")))
+}
+
 impl dkg::SecretStore for FileSecretStore {
     async fn put_share(&mut self, epoch: Epoch, share: Share) {
-        self.inner
-            .lock()
-            .shares
-            .insert(epoch.get(), hex(&share.encode()));
-        self.flush().expect("failed to flush share");
+        self.update(|inner| {
+            inner.shares.insert(epoch.get(), hex(&share.encode()));
+            Ok(())
+        })
+        .expect("failed to flush share");
     }
 
     async fn get_share(&mut self, epoch: Epoch) -> Option<Share> {
@@ -698,11 +825,11 @@ impl dkg::SecretStore for FileSecretStore {
     }
 
     async fn put_seed(&mut self, epoch: Epoch, seed: Summary) {
-        self.inner
-            .lock()
-            .seeds
-            .insert(epoch.get(), hex(&seed.encode()));
-        self.flush().expect("failed to flush seed");
+        self.update(|inner| {
+            inner.seeds.insert(epoch.get(), hex(&seed.encode()));
+            Ok(())
+        })
+        .expect("failed to flush seed");
     }
 
     async fn get_seed(&mut self, epoch: Epoch) -> Option<Summary> {
@@ -718,11 +845,11 @@ impl dkg::SecretStore for FileSecretStore {
         private: DealerPrivMsg,
     ) {
         let key = Self::dealing_key(epoch, &dealer);
-        self.inner
-            .lock()
-            .dealings
-            .insert(key, hex(&private.encode()));
-        self.flush().expect("failed to flush dealing");
+        self.update(|inner| {
+            inner.dealings.insert(key, hex(&private.encode()));
+            Ok(())
+        })
+        .expect("failed to flush dealing");
     }
 
     async fn get_dealing<P: commonware_cryptography::PublicKey>(
@@ -737,19 +864,17 @@ impl dkg::SecretStore for FileSecretStore {
     }
 
     async fn prune(&mut self, min: Epoch) {
-        let mut inner = self.inner.lock();
-        inner.shares.retain(|epoch, _| *epoch >= min.get());
-        inner.seeds.retain(|epoch, _| *epoch >= min.get());
-        inner.dealings.retain(|key, _| {
-            key.split_once(':')
-                .and_then(|(epoch, _)| epoch.parse::<u64>().ok())
-                .is_some_and(|epoch| epoch >= min.get())
-        });
-        inner
-            .aggregation_epochs
-            .retain(|epoch, _| *epoch >= min.get());
-        drop(inner);
-        self.flush().expect("failed to flush prune");
+        self.update(|inner| {
+            inner.shares.retain(|epoch, _| *epoch >= min.get());
+            inner.seeds.retain(|epoch, _| *epoch >= min.get());
+            inner.dealings.retain(|key, _| {
+                key.split_once(':')
+                    .and_then(|(epoch, _)| epoch.parse::<u64>().ok())
+                    .is_some_and(|epoch| epoch >= min.get())
+            });
+            Ok(())
+        })
+        .expect("failed to flush prune");
     }
 }
 
@@ -801,7 +926,21 @@ impl dkg::SecretStore for RetainedSecretStore {
             .map_err(|_| ());
         let safe = retained_prune_epoch(requested, floor, cleanup);
         self.inner.prune(safe).await;
+        self.provider
+            .erase_private_before(safe)
+            .expect("failed to erase retired aggregation schemes");
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn retained_prune_epoch(
@@ -1084,6 +1223,99 @@ mod tests {
     }
 
     #[test]
+    fn secret_store_updates_are_atomic_and_reloadable() {
+        let directory = std::env::temp_dir().join(format!(
+            "commonware-reshare-atomic-secrets-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("secrets.json");
+        let store = FileSecretStore::load(&path).unwrap();
+        let epoch = Epoch::new(7);
+        let (_, _, share) = aggregation_material(27);
+
+        store.put_initial_share(epoch, share.clone()).unwrap();
+        store.set_aggregation_floor(epoch).unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        serde_json::from_slice::<SecretData>(&contents).unwrap();
+        let reloaded = FileSecretStore::load(&path).unwrap();
+        assert_eq!(reloaded.share(epoch).unwrap(), Some(share.clone()));
+        assert_eq!(reloaded.aggregation_floor(), Some(epoch));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+
+        let temp = secret_temp_path(&path).unwrap();
+        std::fs::write(&temp, b"stale secret material").unwrap();
+        let reloaded = FileSecretStore::load(&path).unwrap();
+        assert_eq!(reloaded.share(epoch).unwrap(), Some(share));
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn independently_loaded_secret_stores_serialize_updates() {
+        let directory = std::env::temp_dir().join(format!(
+            "commonware-reshare-concurrent-secrets-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("secrets.json");
+        let (_, _, share) = aggregation_material(29);
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut threads = Vec::new();
+
+        for epoch in 1..=4 {
+            let store = FileSecretStore::load(&path).unwrap();
+            let barrier = barrier.clone();
+            let share = share.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.put_initial_share(Epoch::new(epoch), share).unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let reloaded = FileSecretStore::load(&path).unwrap();
+        for epoch in 1..=4 {
+            assert!(reloaded.share(Epoch::new(epoch)).unwrap().is_some());
+        }
+        assert!(!secret_temp_path(&path).unwrap().exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_store_updates_preserve_restrictive_permissions() {
+        let directory = std::env::temp_dir().join(format!(
+            "commonware-reshare-secret-permissions-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("secrets.json");
+        let store = FileSecretStore::load(&path).unwrap();
+        let (_, _, share) = aggregation_material(28);
+
+        store
+            .put_initial_share(Epoch::new(1), share.clone())
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        store.put_initial_share(Epoch::new(2), share).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn aggregation_provider_reconstructs_signers_after_restart() {
         let path = std::env::temp_dir().join(format!(
             "commonware-reshare-aggregation-restart-{}.json",
@@ -1097,8 +1329,12 @@ mod tests {
 
         let provider = DynamicProvider::<AggregationScheme>::load(store).unwrap();
         provider
-            .register_authenticated(epoch, participants, sharing, Some(share))
+            .register_authenticated(epoch, participants.clone(), sharing.clone(), Some(share))
             .unwrap();
+        provider
+            .register_authenticated(epoch, participants, sharing, None)
+            .unwrap();
+        assert!(provider.scheme(epoch).unwrap().share().is_some());
         let verifier_epoch = Epoch::new(4);
         let (participants, sharing, _) = aggregation_material(32);
         provider
@@ -1145,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregation_descriptors_follow_exact_prune_floor() {
+    fn aggregation_descriptors_survive_secret_pruning() {
         let path = std::env::temp_dir().join(format!(
             "commonware-reshare-aggregation-prune-{}.json",
             std::process::id()
@@ -1174,20 +1410,37 @@ mod tests {
         commonware_runtime::deterministic::Runner::default().start(|_| async {
             store.prune(Epoch::new(2)).await;
         });
+        provider.erase_private_before(Epoch::new(2)).unwrap();
+        assert!(provider.scheme(Epoch::new(1)).unwrap().share().is_none());
+        assert!(provider.scheme(Epoch::new(2)).unwrap().share().is_some());
         let restarted =
             DynamicProvider::<AggregationScheme>::load(FileSecretStore::load(&path).unwrap())
                 .unwrap();
-        assert!(restarted.scheme(Epoch::new(1)).is_none());
-        assert!(restarted.scheme(Epoch::new(2)).is_some());
+        assert!(restarted.scheme(Epoch::new(1)).unwrap().share().is_none());
+        assert!(restarted.scheme(Epoch::new(2)).unwrap().share().is_some());
 
         let mut store = FileSecretStore::load(&path).unwrap();
         commonware_runtime::deterministic::Runner::default().start(|_| async {
             store.prune(Epoch::new(3)).await;
         });
+        provider.erase_private_before(Epoch::new(3)).unwrap();
         let restarted =
             DynamicProvider::<AggregationScheme>::load(FileSecretStore::load(&path).unwrap())
                 .unwrap();
-        assert!(restarted.scheme(Epoch::new(2)).is_none());
+        assert!(restarted.scheme(Epoch::new(1)).unwrap().share().is_none());
+        assert!(restarted.scheme(Epoch::new(2)).unwrap().share().is_none());
+
+        restarted.set_discovery_floor(Epoch::new(2)).unwrap();
+        let namespace =
+            <AggregationScheme as aggregation::scheme::Scheme<sha256::Digest>>::recovery_namespace(
+                &restarted.scheme(Epoch::new(1)).unwrap(),
+            );
+        assert_eq!(
+            commonware_glue::dkg::orchestrator::aggregation::Provider::oldest_epoch(
+                &restarted, namespace
+            ),
+            Some(Epoch::new(2))
+        );
 
         assert_eq!(
             retained_prune_epoch(Epoch::new(9), Ok(Some(Epoch::new(2))), Ok(None)),

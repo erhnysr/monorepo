@@ -145,6 +145,14 @@ pub enum Error {
         /// Parked recovery failure.
         source: parked::Error,
     },
+    /// Durable history rejected a certificate reported by a live engine.
+    #[error("aggregation history rejected the live certificate at epoch {epoch}, height {height}")]
+    HistoryRejected {
+        /// Epoch reported by the live engine.
+        epoch: Epoch,
+        /// Global height reported by the live engine.
+        height: commonware_consensus::types::Height,
+    },
 }
 
 enum Message<A: Acknowledgement> {
@@ -263,6 +271,7 @@ where
 struct EpochDescriptor<S> {
     scheme: Arc<S>,
     journal: JournalConfig,
+    journal_archived: bool,
 }
 
 struct Active<S> {
@@ -338,6 +347,10 @@ where
         recovery: Recovery,
         muxer: MuxHandle<NS, NR>,
     ) -> (Self, Handler<BK, ACK>) {
+        assert!(
+            !config.parked_interval.is_zero(),
+            "parked interval must be non-zero"
+        );
         let current_epoch = config.current_epoch;
         let epocher = config.epocher.clone();
         let (sender, receiver) = mailbox::new(context.child("mailbox"), config.mailbox_size);
@@ -643,6 +656,7 @@ where
                 page_cache: self.config.engine.journal_page_cache.clone(),
             },
             scheme,
+            journal_archived: false,
         })
     }
 
@@ -776,7 +790,12 @@ where
         // ingress is backpressured, the synced journal remains authoritative
         // and a parked pass will replay it later.
         match self.history.archive(key, certificate.encode()).await {
-            Ok(_) | Err(RequestError::Backpressured) => Ok(()),
+            Ok(history::ArchiveStatus::Stored | history::ArchiveStatus::Duplicate)
+            | Err(RequestError::Backpressured) => Ok(()),
+            Ok(history::ArchiveStatus::Rejected) => Err(Error::HistoryRejected {
+                epoch: certificate.epoch,
+                height: certificate.item.position,
+            }),
             Err(RequestError::Closed) => Err(Error::HistoryClosed),
         }
     }
@@ -805,6 +824,7 @@ where
             .child("parked_verifier")
             .with_attribute("epoch", epoch);
         let journal = descriptor.journal.clone();
+        let journal_archived = descriptor.journal_archived;
         let provider = self.provider.clone();
         let scheme = descriptor.scheme.clone();
         let strategy = self.config.strategy.clone();
@@ -822,6 +842,7 @@ where
                 &mut history,
                 &mut recovery,
                 missing_batch,
+                journal_archived,
             )
             .await;
             (epoch, outcome)
@@ -836,7 +857,13 @@ where
         self.parked_running.remove(&epoch);
         self.parked_cursor = Some(epoch);
         match outcome {
-            Ok(ParkedOutcome::Parked) | Err(parked::Error::HistoryBackpressured) => Ok(()),
+            Ok(ParkedOutcome::Parked { journal_archived }) => {
+                if let Some(descriptor) = self.parked.get_mut(&epoch) {
+                    descriptor.journal_archived |= journal_archived;
+                }
+                Ok(())
+            }
+            Err(parked::Error::HistoryBackpressured) => Ok(()),
             Ok(ParkedOutcome::Retired) => {
                 self.parked.remove(&epoch);
                 self.degraded.remove(&epoch);
@@ -851,9 +878,20 @@ where
     fn update_lifecycle_metrics(&self) {
         let _ = self.parked_epochs.try_set(self.parked.len());
         let _ = self.degraded_epochs.try_set(self.degraded.len());
+        let oldest = self
+            .active
+            .iter()
+            .find_map(|(epoch, active)| active.descriptor.scheme.me().is_some().then_some(epoch))
+            .into_iter()
+            .chain(
+                self.parked.iter().find_map(|(epoch, descriptor)| {
+                    descriptor.scheme.me().is_some().then_some(epoch)
+                }),
+            )
+            .min();
         let _ = self
             .retained_key_age_epochs
-            .try_set(self.degraded.first().map_or(0, |epoch| {
+            .try_set(oldest.map_or(0, |epoch| {
                 self.current_epoch.get().saturating_sub(epoch.get())
             }));
     }

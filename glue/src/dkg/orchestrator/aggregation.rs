@@ -707,7 +707,7 @@ where
     }
 
     async fn produce(&self, key: RecoveryKey) -> Result<Option<Bytes>, Error> {
-        if self.authenticated(key).is_none() {
+        if key.namespace != self.namespace {
             return Ok(None);
         }
         let certificate = self

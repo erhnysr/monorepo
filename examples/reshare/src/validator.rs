@@ -59,7 +59,7 @@ use commonware_storage::{
     translator::TwoCap,
 };
 use commonware_utils::{NZDuration, NZU64, NZUsize, acknowledgement::Exact, sequence::Unit};
-use std::{marker::PhantomData, path::PathBuf, time::Duration};
+use std::{marker::PhantomData, num::NonZeroUsize, path::PathBuf, time::Duration};
 use tracing::error;
 
 /// Start a validator node.
@@ -221,7 +221,6 @@ pub async fn run(context: tokio::Context, args: Validator) {
             producer: history.clone(),
             mailbox_size: MAILBOX_SIZE,
             me: Some(local.clone()),
-            initial: Duration::from_secs(1),
             timeout: Duration::from_secs(2),
             fetch_retry_timeout: Duration::from_millis(250),
             priority_requests: false,
@@ -246,8 +245,21 @@ pub async fn run(context: tokio::Context, args: Validator) {
                     .expect("aggregation ack mux task")
                     .expect("aggregation ack mux failure");
             });
-    let store = RetainedSecretStore::new(store, history.clone(), aggregation_namespace);
+    let store = RetainedSecretStore::new(
+        store,
+        history.clone(),
+        aggregation_namespace,
+        aggregation_provider.clone(),
+    );
 
+    let aggregation_window = NZU64!(64);
+    let checkpoint_capacity = NonZeroUsize::new(
+        AGGREGATION_ACTIVE_EPOCHS
+            .get()
+            .checked_mul(aggregation_window.get() as usize)
+            .expect("aggregation checkpoint capacity overflow"),
+    )
+    .expect("aggregation checkpoint capacity must be non-zero");
     let (checkpoint_actor, checkpoint_automaton) =
         orchestrator::checkpoints::Actor::<_, Block, Exact>::init(
             context.child("aggregation_checkpoints"),
@@ -259,7 +271,7 @@ pub async fn run(context: tokio::Context, args: Validator) {
                     (),
                 ),
                 mailbox_size: MAILBOX_SIZE,
-                max_pending_requests: NZUsize!(192),
+                max_pending_requests: checkpoint_capacity,
             },
         )
         .await
@@ -462,7 +474,7 @@ pub async fn run(context: tokio::Context, args: Validator) {
                 priority_acks: false,
                 rebroadcast_timeout: NZDuration!(Duration::from_secs(1)),
                 recovery_after_rebroadcasts: NZU64!(3),
-                window: NZU64!(64),
+                window: aggregation_window,
                 journal_partition_prefix: format!("{partition_prefix}-aggregation-engine"),
                 journal_write_buffer: IO_BUFFER_SIZE,
                 journal_replay_buffer: IO_BUFFER_SIZE,

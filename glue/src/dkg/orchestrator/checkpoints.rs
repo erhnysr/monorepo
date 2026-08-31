@@ -4,14 +4,17 @@
 //! A block acknowledgement is released only after its checkpoint is synced.
 
 use commonware_actor::{
-    Feedback,
-    mailbox::{self, Overflow, Policy, Sender},
+    Feedback, Unreliable,
+    mailbox::{self, Overflow, UnreliablePolicy, UnreliableReceiver, UnreliableSender},
 };
 use commonware_codec::Read;
 use commonware_consensus::{Automaton, Block, Reporter, marshal::Update, types::Height};
 use commonware_cryptography::Digest;
 use commonware_macros::select_loop;
-use commonware_runtime::{ContextCell, Handle, Spawner, spawn_cell};
+use commonware_runtime::{
+    ContextCell, Handle, Spawner, spawn_cell,
+    telemetry::metrics::{Counter, MetricsExt as _},
+};
 use commonware_storage::{
     Context,
     archive::{Archive as _, Identifier, immutable},
@@ -49,7 +52,7 @@ pub struct Config<C> {
     /// Maximum unresolved proposal and verification requests.
     ///
     /// Configure at least the sum of all aggregation-engine windows that share
-    /// this checkpoint store. Excess requests are declined by closing their response.
+    /// this checkpoint store. Exceeding this limit is a fatal configuration error.
     pub max_pending_requests: NonZeroUsize,
 }
 
@@ -73,11 +76,23 @@ pub enum Error {
         /// Height returned by the consensus block.
         block: Height,
     },
+    /// More unresolved requests reached the actor than its configured bound.
+    #[error("checkpoint pending request capacity exhausted")]
+    RequestCapacity,
 }
 
 enum Request<D> {
     Propose(oneshot::Sender<D>),
     Verify(D, oneshot::Sender<bool>),
+}
+
+impl<D> Request<D> {
+    fn response_closed(&self) -> bool {
+        match self {
+            Self::Propose(response) => response.is_closed(),
+            Self::Verify(_, response) => response.is_closed(),
+        }
+    }
 }
 
 enum Message<B: FinalizedBlock, A: Acknowledgement> {
@@ -86,6 +101,7 @@ enum Message<B: FinalizedBlock, A: Acknowledgement> {
         height: Height,
         request: Request<B::Checkpoint>,
         maximum: usize,
+        capacity_exhaustions: Counter,
     },
 }
 
@@ -100,6 +116,21 @@ impl<B: FinalizedBlock, A: Acknowledgement> Default for Pending<B, A> {
             messages: VecDeque::new(),
             requests: 0,
         }
+    }
+}
+
+impl<B: FinalizedBlock, A: Acknowledgement> Pending<B, A> {
+    fn prune_closed_requests(&mut self) {
+        self.messages.retain(|message| {
+            let closed = matches!(
+                message,
+                Message::Request { request, .. } if request.response_closed()
+            );
+            if closed {
+                self.requests -= 1;
+            }
+            !closed
+        });
     }
 }
 
@@ -125,24 +156,37 @@ impl<B: FinalizedBlock, A: Acknowledgement> Overflow<Message<B, A>> for Pending<
     }
 }
 
-impl<B: FinalizedBlock, A: Acknowledgement> Policy for Message<B, A> {
+impl<B: FinalizedBlock, A: Acknowledgement> UnreliablePolicy for Message<B, A> {
     type Overflow = Pending<B, A>;
 
-    fn handle(overflow: &mut Self::Overflow, message: Self) {
-        if let Self::Request { maximum, .. } = &message {
+    fn handle(overflow: &mut Self::Overflow, message: Self) -> bool {
+        if let Self::Request {
+            request,
+            maximum,
+            capacity_exhaustions,
+            ..
+        } = &message
+        {
+            if request.response_closed() {
+                return true;
+            }
+            overflow.prune_closed_requests();
             if overflow.requests >= *maximum {
-                return;
+                capacity_exhaustions.inc();
+                return false;
             }
             overflow.requests += 1;
         }
         overflow.messages.push_back(message);
+        true
     }
 }
 
 /// Cloneable finalized-block reporter and aggregation automaton.
 pub struct Handler<B: FinalizedBlock, A: Acknowledgement> {
-    sender: Sender<Message<B, A>>,
+    sender: UnreliableSender<Message<B, A>>,
     max_pending_requests: usize,
+    capacity_exhaustions: Counter,
     _types: PhantomData<fn() -> (B, A)>,
 }
 
@@ -151,6 +195,7 @@ impl<B: FinalizedBlock, A: Acknowledgement> Clone for Handler<B, A> {
         Self {
             sender: self.sender.clone(),
             max_pending_requests: self.max_pending_requests,
+            capacity_exhaustions: self.capacity_exhaustions.clone(),
             _types: PhantomData,
         }
     }
@@ -163,8 +208,13 @@ impl<B: FinalizedBlock, A: Acknowledgement> Reporter for Handler<B, A> {
         let Update::Block(block, acknowledgement) = activity else {
             return Feedback::Ok;
         };
-        self.sender
+        match self
+            .sender
             .enqueue(Message::Finalized(block, acknowledgement))
+        {
+            Unreliable::Outcome(feedback) => feedback,
+            Unreliable::Rejected => unreachable!("finalized checkpoints are never rejected"),
+        }
     }
 }
 
@@ -174,22 +224,40 @@ impl<B: FinalizedBlock, A: Acknowledgement> Automaton for Handler<B, A> {
 
     async fn propose(&mut self, height: Height) -> oneshot::Receiver<Self::Digest> {
         let (response, receiver) = oneshot::channel();
-        let _ = self.sender.enqueue(Message::Request {
+        let feedback = self.sender.enqueue(Message::Request {
             height,
             request: Request::Propose(response),
             maximum: self.max_pending_requests,
+            capacity_exhaustions: self.capacity_exhaustions.clone(),
         });
+        Self::assert_request_accepted(feedback);
         receiver
     }
 
     async fn verify(&mut self, height: Height, digest: Self::Digest) -> oneshot::Receiver<bool> {
         let (response, receiver) = oneshot::channel();
-        let _ = self.sender.enqueue(Message::Request {
+        let feedback = self.sender.enqueue(Message::Request {
             height,
             request: Request::Verify(digest, response),
             maximum: self.max_pending_requests,
+            capacity_exhaustions: self.capacity_exhaustions.clone(),
         });
+        Self::assert_request_accepted(feedback);
         receiver
+    }
+}
+
+impl<B: FinalizedBlock, A: Acknowledgement> Handler<B, A> {
+    fn assert_request_accepted(feedback: Unreliable<Feedback>) {
+        match feedback {
+            Unreliable::Outcome(Feedback::Ok | Feedback::Backoff) => {}
+            Unreliable::Outcome(Feedback::Closed) => {
+                panic!("checkpoint actor mailbox closed")
+            }
+            Unreliable::Rejected => {
+                panic!("checkpoint request mailbox capacity exhausted")
+            }
+        }
     }
 }
 
@@ -204,10 +272,11 @@ where
 {
     context: ContextCell<E>,
     archive: Option<Archive<E, B::Checkpoint>>,
-    receiver: mailbox::Receiver<Message<B, A>>,
+    receiver: UnreliableReceiver<Message<B, A>>,
     waiters: BTreeMap<Height, Vec<Request<B::Checkpoint>>>,
     pending_requests: usize,
     max_pending_requests: usize,
+    capacity_exhaustions: Counter,
 }
 
 impl<E, B, A> Actor<E, B, A>
@@ -222,7 +291,12 @@ where
         config: Config<<B::Checkpoint as Read>::Cfg>,
     ) -> Result<(Self, Handler<B, A>), Error> {
         let archive = immutable::Archive::init(context.child("archive"), config.archive).await?;
-        let (sender, receiver) = mailbox::new(context.child("mailbox"), config.mailbox_size);
+        let capacity_exhaustions = context.counter(
+            "request_capacity_exhaustions",
+            "Checkpoint requests rejected after exhausting configured capacity",
+        );
+        let (sender, receiver) =
+            mailbox::new_unreliable(context.child("mailbox"), config.mailbox_size);
         Ok((
             Self {
                 context: ContextCell::new(context),
@@ -231,10 +305,12 @@ where
                 waiters: BTreeMap::new(),
                 pending_requests: 0,
                 max_pending_requests: config.max_pending_requests.get(),
+                capacity_exhaustions: capacity_exhaustions.clone(),
             },
             Handler {
                 sender,
                 max_pending_requests: config.max_pending_requests.get(),
+                capacity_exhaustions,
                 _types: PhantomData,
             },
         ))
@@ -265,16 +341,33 @@ where
         height: Height,
         request: Request<B::Checkpoint>,
     ) -> Result<(), Error> {
+        if request.response_closed() {
+            return Ok(());
+        }
         let archive = self.archive.as_ref().expect("archive unavailable");
         if let Some(digest) = archive.get(Identifier::Index(height.get())).await? {
             Self::resolve(request, digest);
-        } else if self.pending_requests == self.max_pending_requests {
-            drop(request);
         } else {
+            self.prune_closed_waiters();
+            if self.pending_requests == self.max_pending_requests {
+                self.capacity_exhaustions.inc();
+                return Err(Error::RequestCapacity);
+            }
             self.waiters.entry(height).or_default().push(request);
             self.pending_requests += 1;
         }
         Ok(())
+    }
+
+    fn prune_closed_waiters(&mut self) {
+        let mut removed = 0;
+        self.waiters.retain(|_, requests| {
+            let previous = requests.len();
+            requests.retain(|request| !request.response_closed());
+            removed += previous - requests.len();
+            !requests.is_empty()
+        });
+        self.pending_requests -= removed;
     }
 
     async fn finalized(&mut self, block: Arc<B>, acknowledgement: A) -> Result<(), Error> {
@@ -334,9 +427,11 @@ mod tests {
         Digestible as _, Hasher as _, Sha256, sha256::Digest as Sha256Digest,
     };
     use commonware_runtime::{
-        Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
+        Metrics as _, Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
+        reschedule,
     };
     use commonware_utils::{NZU16, NZU64, NZUsize, acknowledgement::Exact};
+    use futures::FutureExt as _;
 
     type TestBlock = MockBlock<Sha256Digest, u64>;
 
@@ -446,7 +541,105 @@ mod tests {
     }
 
     #[test]
-    fn pending_requests_are_bounded() {
+    fn overflow_capacity_exhaustion_is_fatal() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut cfg = config(&context);
+            cfg.max_pending_requests = NZUsize!(1);
+            let (_actor, mut handler) =
+                Actor::<_, TestBlock, Exact>::init(context.child("actor"), cfg)
+                    .await
+                    .unwrap();
+
+            let _first = handler.propose(Height::new(1)).await;
+            let _second = handler.propose(Height::new(2)).await;
+            let result = std::panic::AssertUnwindSafe(handler.propose(Height::new(3)))
+                .catch_unwind()
+                .await;
+
+            assert!(result.is_err());
+            assert!(
+                context
+                    .encode()
+                    .contains("request_capacity_exhaustions_total 1")
+            );
+        });
+    }
+
+    #[test]
+    fn actor_capacity_exhaustion_is_fatal() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut cfg = config(&context);
+            cfg.mailbox_size = NZUsize!(8);
+            cfg.max_pending_requests = NZUsize!(1);
+            let (actor, mut handler) =
+                Actor::<_, TestBlock, Exact>::init(context.child("actor"), cfg)
+                    .await
+                    .unwrap();
+            let handle = actor.start();
+
+            let first = handler.propose(Height::new(1)).await;
+            reschedule().await;
+            let second = handler.propose(Height::new(2)).await;
+
+            assert!(matches!(handle.await, Ok(Err(Error::RequestCapacity))));
+            assert!(first.await.is_err());
+            assert!(second.await.is_err());
+            assert!(
+                context
+                    .encode()
+                    .contains("request_capacity_exhaustions_total 1")
+            );
+        });
+    }
+
+    #[test]
+    fn canceled_waiter_releases_actor_capacity() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut cfg = config(&context);
+            cfg.max_pending_requests = NZUsize!(1);
+            let (actor, mut handler) =
+                Actor::<_, TestBlock, Exact>::init(context.child("actor"), cfg)
+                    .await
+                    .unwrap();
+            let handle = actor.start();
+
+            let canceled = handler.propose(Height::new(1)).await;
+            reschedule().await;
+            drop(canceled);
+
+            let second = handler.propose(Height::new(2)).await;
+            reschedule().await;
+            let (acknowledgement, acknowledged) = Exact::handle();
+            let expected = block(2, 2);
+            let digest = expected.digest();
+            let _ = handler.report(Update::Block(Arc::new(expected), acknowledgement));
+
+            assert_eq!(second.await.unwrap(), digest);
+            acknowledged.await.unwrap();
+            handle.abort();
+        });
+    }
+
+    #[test]
+    fn canceled_overflow_request_releases_capacity() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut cfg = config(&context);
+            cfg.mailbox_size = NZUsize!(1);
+            cfg.max_pending_requests = NZUsize!(1);
+            let (_actor, mut handler) =
+                Actor::<_, TestBlock, Exact>::init(context.child("actor"), cfg)
+                    .await
+                    .unwrap();
+
+            let _ready = handler.propose(Height::new(1)).await;
+            let canceled = handler.propose(Height::new(2)).await;
+            drop(canceled);
+            let _replacement = handler.propose(Height::new(3)).await;
+        });
+    }
+
+    #[test]
+    fn canceled_queued_request_releases_capacity() {
         deterministic::Runner::default().start(|context| async move {
             let mut cfg = config(&context);
             cfg.max_pending_requests = NZUsize!(1);
@@ -455,16 +648,18 @@ mod tests {
                     .await
                     .unwrap();
 
-            let first = handler.propose(Height::new(1)).await;
-            let second = handler.propose(Height::new(2)).await;
-            let third = handler.propose(Height::new(3)).await;
+            let canceled = handler.propose(Height::new(1)).await;
+            drop(canceled);
+            let replacement = handler.propose(Height::new(2)).await;
             let handle = actor.start();
-            let (acknowledgement, acknowledged) = Exact::handle();
-            let _ = handler.report(Update::Block(Arc::new(block(1, 1)), acknowledgement));
+            reschedule().await;
 
-            assert!(first.await.is_ok());
-            assert!(second.await.is_err());
-            assert!(third.await.is_err());
+            let (acknowledgement, acknowledged) = Exact::handle();
+            let expected = block(2, 2);
+            let digest = expected.digest();
+            let _ = handler.report(Update::Block(Arc::new(expected), acknowledgement));
+
+            assert_eq!(replacement.await.unwrap(), digest);
             acknowledged.await.unwrap();
             handle.abort();
         });
