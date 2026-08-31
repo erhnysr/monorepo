@@ -809,12 +809,13 @@ fn retained_prune_epoch(
     floor: Result<Option<Epoch>, ()>,
     cleanup: Result<Option<Epoch>, ()>,
 ) -> Epoch {
+    let (Ok(floor), Ok(cleanup)) = (floor, cleanup) else {
+        return Epoch::zero();
+    };
     [floor, cleanup]
         .into_iter()
-        .try_fold(requested, |safe, bound| {
-            bound.map(|bound| bound.map_or(safe, |bound| safe.min(bound)))
-        })
-        .unwrap_or_else(|()| Epoch::zero())
+        .flatten()
+        .fold(requested, Epoch::min)
 }
 
 /// Application QMDB config with partitions derived from `prefix`.
