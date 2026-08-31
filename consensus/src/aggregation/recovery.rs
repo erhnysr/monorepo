@@ -1,7 +1,7 @@
 //! Shared scheduling for active aggregation recovery.
 
 use super::types::RecoveryKey;
-use commonware_actor::{Feedback, mailbox};
+use commonware_actor::{Feedback, Unreliable, mailbox};
 use commonware_macros::select_loop;
 use commonware_resolver::Resolver;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
@@ -20,8 +20,8 @@ use std::{
 pub trait Recoverer: Clone + Send + 'static {
     /// Requests `key` if it is not already requested.
     ///
-    /// [`Feedback::Backoff`] can mean the request was not admitted. Callers may retry it.
-    fn fetch(&mut self, key: RecoveryKey) -> Feedback;
+    /// [`Unreliable::Rejected`] means the request was not admitted. Callers may retry it.
+    fn fetch(&mut self, key: RecoveryKey) -> Unreliable<Feedback>;
 
     /// Cancels the exact admitted `key`.
     fn cancel(&mut self, key: RecoveryKey) -> Feedback;
@@ -117,13 +117,13 @@ mod tests {
             assert!(recovery.fetch(keys[0]).accepted());
             assert!(recovery.fetch(keys[1]).accepted());
             for &key in &keys[2..] {
-                assert_eq!(recovery.fetch(key), Feedback::Backoff);
+                assert_eq!(recovery.fetch(key), Unreliable::Rejected);
             }
 
             // Canceling one admitted key makes exactly one slot available before attachment.
             assert!(recovery.cancel(keys[0]).accepted());
             assert!(recovery.fetch(keys[2]).accepted());
-            assert_eq!(recovery.fetch(keys[3]), Feedback::Backoff);
+            assert_eq!(recovery.fetch(keys[3]), Unreliable::Rejected);
 
             let handle = coordinator.attach(resolver).start();
             while state.lock().active.len() < 2 {
@@ -291,30 +291,27 @@ impl Clone for Recovery {
 }
 
 impl Recoverer for Recovery {
-    fn fetch(&mut self, key: RecoveryKey) -> Feedback {
+    fn fetch(&mut self, key: RecoveryKey) -> Unreliable<Feedback> {
         let mut admission = self.admission.lock();
         if admission.closed {
-            return Feedback::Closed;
+            return Unreliable::new(Feedback::Closed);
         }
         if admission.keys.contains_key(&key) {
             let feedback = self.mailbox.enqueue(Wake);
             if feedback == Feedback::Closed {
                 admission.keys.remove(&key);
             }
-            return feedback;
+            return Unreliable::new(feedback);
         }
         if admission.keys.len() >= self.cap {
-            return match self.mailbox.enqueue(Wake) {
-                Feedback::Closed => Feedback::Closed,
-                _ => Feedback::Backoff,
-            };
+            return Unreliable::rejected();
         }
         admission.keys.insert(key, Arc::new(()));
         let feedback = self.mailbox.enqueue(Wake);
         if feedback == Feedback::Closed {
             admission.keys.remove(&key);
         }
-        feedback
+        Unreliable::new(feedback)
     }
 
     fn cancel(&mut self, key: RecoveryKey) -> Feedback {
@@ -330,7 +327,8 @@ impl Recoverer for Recovery {
 /// Actor that shares one logical outstanding recovery cap across engine scopes.
 ///
 /// The cap is applied synchronously to every admitted key, including work waiting for the actor.
-/// Excess distinct fetches return [`Feedback::Backoff`] without being retained and can be retried.
+/// Excess distinct fetches return [`Unreliable::Rejected`] without being retained and can be
+/// retried.
 /// Actor wakeups are coalesced, so fetch and cancel churn cannot create unbounded mailbox overflow.
 pub struct RecoveryCoordinator<E, R>
 where

@@ -6,6 +6,7 @@
 //! exact retirement.
 
 use super::aggregation::{ArchiveStatus, Cleanup, Handler, Provider, RequestError, Retirement};
+use commonware_actor::Unreliable;
 use commonware_codec::Encode as _;
 use commonware_consensus::{
     aggregation::{
@@ -129,8 +130,11 @@ where
                 epoch: retirement.epoch,
                 position,
             };
-            if recoverer.fetch(key) == commonware_actor::Feedback::Closed {
-                return Err(Error::RecovererClosed);
+            match recoverer.fetch(key) {
+                Unreliable::Outcome(commonware_actor::Feedback::Closed) => {
+                    return Err(Error::RecovererClosed);
+                }
+                Unreliable::Outcome(_) | Unreliable::Rejected => {}
             }
         }
         return Ok(Outcome::Parked);
@@ -246,9 +250,9 @@ mod tests {
     struct RecordingRecoverer(Arc<Mutex<Vec<RecoveryKey>>>);
 
     impl Recoverer for RecordingRecoverer {
-        fn fetch(&mut self, key: RecoveryKey) -> Feedback {
+        fn fetch(&mut self, key: RecoveryKey) -> Unreliable<Feedback> {
             self.0.lock().push(key);
-            Feedback::Ok
+            Unreliable::new(Feedback::Ok)
         }
 
         fn cancel(&mut self, _: RecoveryKey) -> Feedback {
@@ -260,8 +264,8 @@ mod tests {
     struct ClosedRecoverer;
 
     impl Recoverer for ClosedRecoverer {
-        fn fetch(&mut self, _: RecoveryKey) -> Feedback {
-            Feedback::Closed
+        fn fetch(&mut self, _: RecoveryKey) -> Unreliable<Feedback> {
+            Unreliable::new(Feedback::Closed)
         }
 
         fn cancel(&mut self, _: RecoveryKey) -> Feedback {

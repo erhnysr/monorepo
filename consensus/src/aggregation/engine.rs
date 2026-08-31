@@ -8,9 +8,12 @@ use crate::{
     Automaton, Reporter,
     types::{Epoch, Height, Participant},
 };
-use commonware_actor::mailbox::{
-    self, UnreliablePolicy, UnreliableReceiver as MailboxReceiver,
-    UnreliableSender as MailboxSender,
+use commonware_actor::{
+    Unreliable,
+    mailbox::{
+        self, UnreliablePolicy, UnreliableReceiver as MailboxReceiver,
+        UnreliableSender as MailboxSender,
+    },
 };
 use commonware_cryptography::{Digest, certificate::Verifier};
 use commonware_macros::select;
@@ -437,7 +440,14 @@ where
             }
             self.pending
                 .insert(position, Pending::Unverified(BTreeMap::new()));
-            self.recovery_ticks.insert(position, 0);
+            self.recovery_ticks.insert(
+                position,
+                if recover_immediately {
+                    self.recovery_after_rebroadcasts
+                } else {
+                    0
+                },
+            );
             self.rebroadcast_deadlines
                 .put(position, self.context.current() + self.rebroadcast_timeout);
             self.request_digest(position);
@@ -631,7 +641,7 @@ where
             .get_mut(&position)
             .expect("active position missing recovery ticks");
         *ticks = ticks.saturating_add(1);
-        if *ticks == self.recovery_after_rebroadcasts {
+        if *ticks >= self.recovery_after_rebroadcasts {
             self.fetch_recovery(position);
         }
         let Some(me) = self.scheme.me() else {
@@ -655,8 +665,12 @@ where
 
     fn fetch_recovery(&mut self, position: Height) {
         let key = self.recovery_key(position);
-        if self.recovery_requested.insert(key) {
-            self.recoverer.fetch(key);
+        if self.recovery_requested.contains(&key) {
+            return;
+        }
+        if matches!(self.recoverer.fetch(key), Unreliable::Outcome(feedback) if feedback.accepted())
+        {
+            self.recovery_requested.insert(key);
         }
     }
 
@@ -732,15 +746,15 @@ mod tests {
         aggregation::{Recoverer, scheme::ed25519},
         simplex::mocks::wrapped::{Behavior, Scheme as WrappedScheme},
     };
-    use commonware_actor::Feedback;
+    use commonware_actor::{Feedback, Unreliable};
     use commonware_cryptography::{Hasher, Sha256, certificate::mocks::Fixture};
 
     #[derive(Clone)]
     struct NoopRecoverer;
 
     impl Recoverer for NoopRecoverer {
-        fn fetch(&mut self, _: RecoveryKey) -> Feedback {
-            Feedback::Ok
+        fn fetch(&mut self, _: RecoveryKey) -> Unreliable<Feedback> {
+            Unreliable::new(Feedback::Ok)
         }
 
         fn cancel(&mut self, _: RecoveryKey) -> Feedback {

@@ -8,7 +8,7 @@ use crate::{
     Automaton, Reporter,
     types::{Epoch, Height},
 };
-use commonware_actor::Feedback;
+use commonware_actor::{Feedback, Unreliable};
 use commonware_codec::Encode;
 use commonware_cryptography::{
     Hasher, Sha256,
@@ -247,12 +247,27 @@ struct EngineScope {
 #[derive(Clone, Default)]
 struct RecordingRecoverer {
     events: Arc<Mutex<Vec<(bool, RecoveryKey)>>>,
+    reject_first: bool,
+    rejected: Arc<Mutex<BTreeSet<RecoveryKey>>>,
+}
+
+impl RecordingRecoverer {
+    fn rejecting_once() -> Self {
+        Self {
+            reject_first: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Recoverer for RecordingRecoverer {
-    fn fetch(&mut self, key: RecoveryKey) -> Feedback {
+    fn fetch(&mut self, key: RecoveryKey) -> Unreliable<Feedback> {
         self.events.lock().push((true, key));
-        Feedback::Ok
+        if self.reject_first && self.rejected.lock().insert(key) {
+            Unreliable::Rejected
+        } else {
+            Unreliable::new(Feedback::Ok)
+        }
     }
 
     fn cancel(&mut self, key: RecoveryKey) -> Feedback {
@@ -659,6 +674,54 @@ fn test_recovery_threshold_cancellation_and_window_bound() {
         let events = events.lock();
         assert_eq!(events.iter().filter(|(fetch, _)| *fetch).count(), 3);
         assert_eq!(events.iter().filter(|(fetch, _)| !*fetch).count(), 3);
+    });
+}
+
+#[test_traced("INFO")]
+fn test_recovery_retries_rejected_admission() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 4);
+        let epoch = Epoch::new(92);
+        let position = Height::new(520);
+        let participant = fixture.participants[0].clone();
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, false).await;
+        let recoverer = RecordingRecoverer::rejecting_once();
+        let events = recoverer.events.clone();
+        let mut cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            ClosedApplication::default(),
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: "aggregation-recovery-rejected-admission".into(),
+                epoch,
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        cfg.recovery_after_rebroadcasts = NonZeroU64::new(1).unwrap();
+        cfg.recoverer = recoverer;
+        let (engine, mut mailbox) = Engine::new(context.child("engine"), cfg);
+        let handle = engine.start(registrations.remove(&participant).unwrap());
+
+        while events.lock().iter().filter(|(fetch, _)| *fetch).count() < 2 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            mailbox.submit(certificate(&fixture, epoch, position)).await,
+            CertificateOutcome::Accepted
+        );
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Completed
+        );
+
+        let events = events.lock();
+        assert_eq!(events.iter().filter(|(fetch, _)| *fetch).count(), 2);
+        assert_eq!(events.iter().filter(|(fetch, _)| !*fetch).count(), 1);
     });
 }
 

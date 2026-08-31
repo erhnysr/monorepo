@@ -369,8 +369,8 @@ mod tests {
     struct RecordingRecoverer(Arc<Mutex<Vec<RecoveryKey>>>);
 
     impl Recoverer for RecordingRecoverer {
-        fn fetch(&mut self, _: RecoveryKey) -> Feedback {
-            Feedback::Ok
+        fn fetch(&mut self, _: RecoveryKey) -> commonware_actor::Unreliable<Feedback> {
+            commonware_actor::Unreliable::new(Feedback::Ok)
         }
 
         fn cancel(&mut self, key: RecoveryKey) -> Feedback {
