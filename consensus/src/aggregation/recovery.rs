@@ -5,9 +5,11 @@ use commonware_actor::{Feedback, mailbox};
 use commonware_macros::select_loop;
 use commonware_resolver::Resolver;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
+use commonware_utils::sync::Mutex;
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
+    sync::Arc,
 };
 
 /// Requests and cancels aggregation certificate recovery.
@@ -17,9 +19,11 @@ use std::{
 /// signature checks.
 pub trait Recoverer: Clone + Send + 'static {
     /// Requests `key` if it is not already requested.
+    ///
+    /// [`Feedback::Backoff`] can mean the request was not admitted. Callers may retry it.
     fn fetch(&mut self, key: RecoveryKey) -> Feedback;
 
-    /// Cancels the exact requested or queued `key`.
+    /// Cancels the exact admitted `key`.
     fn cancel(&mut self, key: RecoveryKey) -> Feedback;
 }
 
@@ -32,8 +36,8 @@ mod tests {
     };
     use commonware_resolver::Fetch;
     use commonware_runtime::{Clock as _, Runner as _, Supervisor as _, deterministic};
-    use commonware_utils::{NZUsize, sync::Mutex};
-    use std::sync::Arc;
+    use commonware_utils::NZUsize;
+    use std::collections::BTreeSet;
 
     #[derive(Clone, Default)]
     struct MockResolver {
@@ -101,46 +105,101 @@ mod tests {
     }
 
     #[test]
-    fn pre_attachment_cap_dedup_exact_cancel_and_fifo_across_scopes() {
+    fn staged_admission_bounds_all_keys_and_rejected_fetches_are_retriable() {
         deterministic::Runner::default().start(|context| async move {
             let resolver = MockResolver::default();
             let state = resolver.state.clone();
-            let (coordinator, mut recovery) = RecoveryCoordinator::staged(
-                context.child("coordinator"),
-                NZUsize!(2),
-                NZUsize!(16),
-            );
-            let keys = [key(1, 0), key(2, 0), key(1, 1), key(2, 1)];
+            let (coordinator, mut recovery) =
+                RecoveryCoordinator::staged(context.child("coordinator"), NZUsize!(2), NZUsize!(1));
+            let keys: Vec<_> = (0..100).map(|position| key(1, position)).collect();
 
-            recovery.fetch(keys[0]);
-            recovery.fetch(keys[1]);
-            recovery.fetch(keys[2]);
-            recovery.fetch(keys[3]);
-            recovery.fetch(keys[2]);
-            recovery.cancel(keys[3]);
-            recovery.cancel(keys[0]);
-            recovery.cancel(keys[1]);
+            assert!(recovery.fetch(keys[0]).accepted());
+            assert!(recovery.fetch(keys[0]).accepted());
+            assert!(recovery.fetch(keys[1]).accepted());
+            for &key in &keys[2..] {
+                assert_eq!(recovery.fetch(key), Feedback::Backoff);
+            }
+
+            // Canceling one admitted key makes exactly one slot available before attachment.
+            assert!(recovery.cancel(keys[0]).accepted());
+            assert!(recovery.fetch(keys[2]).accepted());
+            assert_eq!(recovery.fetch(keys[3]), Feedback::Backoff);
 
             let handle = coordinator.attach(resolver).start();
-            while state.lock().events.len() < 5 {
+            while state.lock().active.len() < 2 {
                 context.sleep(std::time::Duration::from_millis(1)).await;
             }
 
             {
                 let state = state.lock();
                 assert_eq!(state.high_water, 2);
-                assert_eq!(
-                    state.events,
-                    vec![
-                        (true, keys[0]),
-                        (true, keys[1]),
-                        (false, keys[0]),
-                        (true, keys[2]),
-                        (false, keys[1]),
-                    ]
-                );
-                assert_eq!(state.active, BTreeSet::from([keys[2]]));
+                assert_eq!(state.active, BTreeSet::from([keys[1], keys[2]]));
+                assert_eq!(state.events.len(), 2);
             }
+
+            context.child("stop").stop(0, None).await.unwrap();
+            handle.await.expect("recovery coordinator failed");
+        });
+    }
+
+    #[test]
+    fn coalesced_wakeups_preserve_dedup_and_exact_cancel() {
+        deterministic::Runner::default().start(|context| async move {
+            let resolver = MockResolver::default();
+            let state = resolver.state.clone();
+            let (coordinator, mut recovery) = RecoveryCoordinator::new(
+                context.child("coordinator"),
+                resolver,
+                NZUsize!(1),
+                NZUsize!(1),
+            );
+            let handle = coordinator.start();
+            let requested = key(1, 0);
+
+            assert!(recovery.fetch(requested).accepted());
+            assert!(recovery.fetch(requested).accepted());
+            while state.lock().events.is_empty() {
+                context.sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert!(recovery.cancel(requested).accepted());
+            assert!(recovery.cancel(requested).accepted());
+            assert!(recovery.fetch(requested).accepted());
+            while state.lock().events.len() < 3 {
+                context.sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            assert_eq!(
+                state.lock().events,
+                vec![(true, requested), (false, requested), (true, requested)]
+            );
+
+            context.child("stop").stop(0, None).await.unwrap();
+            handle.await.expect("recovery coordinator failed");
+        });
+    }
+
+    #[test]
+    fn pre_attachment_message_churn_has_bounded_overflow() {
+        deterministic::Runner::default().start(|context| async move {
+            let resolver = MockResolver::default();
+            let state = resolver.state.clone();
+            let (coordinator, mut recovery) =
+                RecoveryCoordinator::staged(context.child("coordinator"), NZUsize!(1), NZUsize!(1));
+            let requested = key(1, 0);
+
+            // A one-element ready queue and one optional overflow wake remain bounded regardless
+            // of churn. Only the final admitted state needs to be reconciled after attachment.
+            for _ in 0..10_000 {
+                recovery.fetch(requested);
+                recovery.cancel(requested);
+            }
+            recovery.fetch(requested);
+
+            let handle = coordinator.attach(resolver).start();
+            while state.lock().events.is_empty() {
+                context.sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert_eq!(state.lock().events, vec![(true, requested)]);
 
             context.child("stop").stop(0, None).await.unwrap();
             handle.await.expect("recovery coordinator failed");
@@ -177,58 +236,111 @@ mod tests {
 }
 
 #[derive(Clone, Copy)]
-enum Message {
-    Fetch(RecoveryKey),
-    Cancel(RecoveryKey),
+struct Wake;
+
+#[derive(Default)]
+struct WakeOverflow(Option<Wake>);
+
+impl mailbox::Overflow<Wake> for WakeOverflow {
+    fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    fn drain<F>(&mut self, mut push: F)
+    where
+        F: FnMut(Wake) -> Option<Wake>,
+    {
+        if let Some(wake) = self.0.take()
+            && let Some(wake) = push(wake)
+        {
+            self.0 = Some(wake);
+        }
+    }
 }
 
-impl mailbox::Policy for Message {
-    type Overflow = VecDeque<Self>;
+impl mailbox::Policy for Wake {
+    type Overflow = WakeOverflow;
 
     fn handle(overflow: &mut Self::Overflow, message: Self) {
-        overflow.push_back(message);
+        overflow.0 = Some(message);
     }
+}
+
+#[derive(Default)]
+struct Admission {
+    // Tokens distinguish a cancellation followed by a new fetch of the same key.
+    keys: BTreeMap<RecoveryKey, Arc<()>>,
+    closed: bool,
 }
 
 /// Cloneable handle to a node-wide aggregation recovery coordinator.
 pub struct Recovery {
-    mailbox: mailbox::Sender<Message>,
+    mailbox: mailbox::Sender<Wake>,
+    admission: Arc<Mutex<Admission>>,
+    cap: usize,
 }
 
 impl Clone for Recovery {
     fn clone(&self) -> Self {
         Self {
             mailbox: self.mailbox.clone(),
+            admission: self.admission.clone(),
+            cap: self.cap,
         }
     }
 }
 
 impl Recoverer for Recovery {
     fn fetch(&mut self, key: RecoveryKey) -> Feedback {
-        self.mailbox.enqueue(Message::Fetch(key))
+        let mut admission = self.admission.lock();
+        if admission.closed {
+            return Feedback::Closed;
+        }
+        if admission.keys.contains_key(&key) {
+            let feedback = self.mailbox.enqueue(Wake);
+            if feedback == Feedback::Closed {
+                admission.keys.remove(&key);
+            }
+            return feedback;
+        }
+        if admission.keys.len() >= self.cap {
+            return match self.mailbox.enqueue(Wake) {
+                Feedback::Closed => Feedback::Closed,
+                _ => Feedback::Backoff,
+            };
+        }
+        admission.keys.insert(key, Arc::new(()));
+        let feedback = self.mailbox.enqueue(Wake);
+        if feedback == Feedback::Closed {
+            admission.keys.remove(&key);
+        }
+        feedback
     }
 
     fn cancel(&mut self, key: RecoveryKey) -> Feedback {
-        self.mailbox.enqueue(Message::Cancel(key))
+        let mut admission = self.admission.lock();
+        if admission.closed {
+            return Feedback::Closed;
+        }
+        admission.keys.remove(&key);
+        self.mailbox.enqueue(Wake)
     }
 }
 
 /// Actor that shares one logical outstanding recovery cap across engine scopes.
 ///
-/// Requests beyond the cap are deduplicated and queued in FIFO order. Canceling an active key
-/// sends the resolver retain operation before issuing the next queued fetch, so a released slot
-/// cannot transiently represent two logical requests in resolver mailbox order.
+/// The cap is applied synchronously to every admitted key, including work waiting for the actor.
+/// Excess distinct fetches return [`Feedback::Backoff`] without being retained and can be retried.
+/// Actor wakeups are coalesced, so fetch and cancel churn cannot create unbounded mailbox overflow.
 pub struct RecoveryCoordinator<E, R>
 where
     E: Spawner + Metrics,
 {
     context: ContextCell<E>,
     resolver: R,
-    receiver: mailbox::Receiver<Message>,
-    cap: usize,
-    active: BTreeSet<RecoveryKey>,
-    queued: VecDeque<RecoveryKey>,
-    queued_set: BTreeSet<RecoveryKey>,
+    receiver: mailbox::Receiver<Wake>,
+    admission: Arc<Mutex<Admission>>,
+    active: BTreeMap<RecoveryKey, Arc<()>>,
 }
 
 impl<E, R> RecoveryCoordinator<E, R>
@@ -258,48 +370,44 @@ where
         select_loop! {
             self.context,
             on_stopped => {},
-            Some(message) = self.receiver.recv() else break => match message {
-                Message::Fetch(key) => self.fetch(key),
-                Message::Cancel(key) => self.cancel(key),
-            },
+            Some(_) = self.receiver.recv() else break => self.reconcile(),
         }
+        let mut admission = self.admission.lock();
+        admission.keys.clear();
+        admission.closed = true;
+        drop(admission);
         self.cancel_active();
     }
 
-    fn fetch(&mut self, key: RecoveryKey) {
-        if self.active.contains(&key) || self.queued_set.contains(&key) {
-            return;
+    fn reconcile(&mut self) {
+        // Keep admission stable while stale requests are canceled and replacements are issued.
+        // This preserves the cap across the resolver boundary, not only in the shared map.
+        let admission = self.admission.lock();
+        let canceled: Vec<_> = self
+            .active
+            .iter()
+            .filter_map(|(key, token)| match admission.keys.get(key) {
+                Some(admitted) if Arc::ptr_eq(token, admitted) => None,
+                _ => Some(*key),
+            })
+            .collect();
+        if !canceled.is_empty() {
+            let canceled = BTreeSet::from_iter(canceled);
+            self.resolver.retain(move |key, ()| !canceled.contains(key));
+            self.active.retain(|key, token| {
+                admission
+                    .keys
+                    .get(key)
+                    .is_some_and(|admitted| Arc::ptr_eq(token, admitted))
+            });
         }
-        if self.active.len() < self.cap {
-            if self.resolver.fetch(key).accepted() {
-                self.active.insert(key);
+
+        for (&key, token) in &admission.keys {
+            if self.active.contains_key(&key) {
+                continue;
             }
-            return;
-        }
-        self.queued.push_back(key);
-        self.queued_set.insert(key);
-    }
-
-    fn cancel(&mut self, key: RecoveryKey) {
-        if self.queued_set.remove(&key) {
-            self.queued.retain(|queued| *queued != key);
-            return;
-        }
-        if !self.active.remove(&key) {
-            return;
-        }
-        self.resolver.retain(move |candidate, ()| *candidate != key);
-        self.fill();
-    }
-
-    fn fill(&mut self) {
-        while self.active.len() < self.cap {
-            let Some(key) = self.queued.pop_front() else {
-                break;
-            };
-            self.queued_set.remove(&key);
             if self.resolver.fetch(key).accepted() {
-                self.active.insert(key);
+                self.active.insert(key, token.clone());
             }
         }
     }
@@ -310,7 +418,7 @@ where
         }
         let active = std::mem::take(&mut self.active);
         self.resolver
-            .retain(move |key, ()| !active.contains(key));
+            .retain(move |key, ()| !active.contains_key(key));
     }
 }
 
@@ -320,25 +428,30 @@ where
 {
     /// Creates a coordinator without a resolver and returns its cloneable handle.
     ///
-    /// Requests may be enqueued through the handle before [`Self::attach`] supplies the resolver.
-    /// The attached coordinator must then be started to process them.
+    /// Requests may be submitted through the handle before [`Self::attach`] supplies the resolver.
+    /// The configured outstanding limit still bounds all admitted requests before attachment. The
+    /// attached coordinator must then be started to process them.
     pub fn staged(
         context: E,
         outstanding: NonZeroUsize,
         mailbox_size: NonZeroUsize,
     ) -> (Self, Recovery) {
         let (mailbox, receiver) = mailbox::new(context.child("mailbox"), mailbox_size);
+        let admission = Arc::new(Mutex::new(Admission::default()));
+        let cap = outstanding.get();
         (
             Self {
                 context: ContextCell::new(context),
                 resolver: (),
                 receiver,
-                cap: outstanding.get(),
-                active: BTreeSet::new(),
-                queued: VecDeque::new(),
-                queued_set: BTreeSet::new(),
+                admission: admission.clone(),
+                active: BTreeMap::new(),
             },
-            Recovery { mailbox },
+            Recovery {
+                mailbox,
+                admission,
+                cap,
+            },
         )
     }
 
@@ -351,10 +464,8 @@ where
             context: self.context,
             resolver,
             receiver: self.receiver,
-            cap: self.cap,
+            admission: self.admission,
             active: self.active,
-            queued: self.queued,
-            queued_set: self.queued_set,
         }
     }
 }
