@@ -256,6 +256,11 @@ impl<S> DynamicProvider<S> {
     pub fn register(&self, epoch: Epoch, scheme: S) {
         self.schemes.lock().insert(epoch, Arc::new(scheme));
     }
+
+    /// Return the newest registered epoch.
+    pub fn latest_epoch(&self) -> Option<Epoch> {
+        self.schemes.lock().keys().copied().max()
+    }
 }
 
 impl<S> CertificateProvider for DynamicProvider<S>
@@ -300,7 +305,8 @@ impl commonware_glue::dkg::orchestrator::aggregation::Provider<AggregationScheme
     }
 
     fn oldest_epoch(&self, namespace: aggregation::types::RecoveryNamespace) -> Option<Epoch> {
-        self.schemes
+        let oldest = self
+            .schemes
             .lock()
             .iter()
             .filter(|(_, scheme)| {
@@ -309,7 +315,13 @@ impl commonware_glue::dkg::orchestrator::aggregation::Provider<AggregationScheme
                 ) == namespace
             })
             .map(|(epoch, _)| *epoch)
-            .min()
+            .min()?;
+        Some(
+            self.descriptors
+                .as_ref()
+                .and_then(FileSecretStore::aggregation_floor)
+                .map_or(oldest, |floor| oldest.max(floor)),
+        )
     }
 }
 
@@ -355,6 +367,14 @@ impl DynamicProvider<AggregationScheme> {
         }
         self.register(epoch, scheme);
         Ok(())
+    }
+
+    /// Persist the first aggregation epoch recoverable after state sync.
+    pub fn set_discovery_floor(&self, epoch: Epoch) -> anyhow::Result<()> {
+        let Some(store) = &self.descriptors else {
+            anyhow::bail!("aggregation provider has no durable descriptor store");
+        };
+        store.set_aggregation_floor(epoch)
     }
 }
 
@@ -525,6 +545,8 @@ struct SecretData {
     dealings: BTreeMap<String, String>,
     #[serde(default)]
     aggregation_epochs: BTreeMap<u64, AggregationEpochDescriptor>,
+    #[serde(default)]
+    aggregation_floor: Option<u64>,
 }
 
 /// Minimum authenticated public material needed to rebuild an aggregation epoch.
@@ -630,6 +652,21 @@ impl FileSecretStore {
             .iter()
             .map(|(&epoch, descriptor)| (Epoch::new(epoch), descriptor.clone()))
             .collect()
+    }
+
+    fn aggregation_floor(&self) -> Option<Epoch> {
+        self.inner.lock().aggregation_floor.map(Epoch::new)
+    }
+
+    fn set_aggregation_floor(&self, epoch: Epoch) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        inner.aggregation_floor = Some(
+            inner
+                .aggregation_floor
+                .map_or(epoch.get(), |floor| floor.max(epoch.get())),
+        );
+        drop(inner);
+        self.flush()
     }
 
     fn share(&self, epoch: Epoch) -> anyhow::Result<Option<Share>> {
@@ -751,23 +788,33 @@ impl dkg::SecretStore for RetainedSecretStore {
     }
 
     async fn prune(&mut self, requested: Epoch) {
-        let safe = retained_prune_epoch(
-            requested,
-            self.history
-                .oldest_unretired(self.namespace)
-                .await
-                .map_err(|_| ()),
-        );
+        let floor = self
+            .history
+            .oldest_unretired(self.namespace)
+            .await
+            .map_err(|_| ());
+        let cleanup = self
+            .history
+            .pending_cleanups(self.namespace, NZUsize!(1))
+            .await
+            .map(|cleanups| cleanups.first().map(|cleanup| cleanup.retirement.epoch))
+            .map_err(|_| ());
+        let safe = retained_prune_epoch(requested, floor, cleanup);
         self.inner.prune(safe).await;
     }
 }
 
-fn retained_prune_epoch(requested: Epoch, floor: Result<Option<Epoch>, ()>) -> Epoch {
-    match floor {
-        Ok(Some(floor)) => std::cmp::min(requested, floor),
-        Ok(None) => requested,
-        Err(()) => Epoch::zero(),
-    }
+fn retained_prune_epoch(
+    requested: Epoch,
+    floor: Result<Option<Epoch>, ()>,
+    cleanup: Result<Option<Epoch>, ()>,
+) -> Epoch {
+    [floor, cleanup]
+        .into_iter()
+        .try_fold(requested, |safe, bound| {
+            bound.map(|bound| bound.map_or(safe, |bound| safe.min(bound)))
+        })
+        .unwrap_or_else(|()| Epoch::zero())
 }
 
 /// Application QMDB config with partitions derived from `prefix`.
@@ -1060,6 +1107,17 @@ mod tests {
                 .register_authenticated(epoch, participants, sharing, None)
                 .is_err()
         );
+        let namespace =
+            <AggregationScheme as aggregation::scheme::Scheme<sha256::Digest>>::recovery_namespace(
+                &provider.scheme(epoch).unwrap(),
+            );
+        assert_eq!(
+            commonware_glue::dkg::orchestrator::aggregation::Provider::oldest_epoch(
+                &provider, namespace,
+            ),
+            Some(epoch)
+        );
+        provider.set_discovery_floor(verifier_epoch).unwrap();
         drop(provider);
 
         let provider =
@@ -1067,10 +1125,6 @@ mod tests {
                 .unwrap();
         assert!(provider.scheme(epoch).unwrap().share().is_some());
         assert!(provider.scheme(verifier_epoch).unwrap().share().is_none());
-        let namespace =
-            <AggregationScheme as aggregation::scheme::Scheme<sha256::Digest>>::recovery_namespace(
-                &provider.scheme(epoch).unwrap(),
-            );
         let authenticated = commonware_glue::dkg::orchestrator::aggregation::Provider::epoch(
             &provider, namespace, epoch,
         )
@@ -1082,7 +1136,7 @@ mod tests {
             commonware_glue::dkg::orchestrator::aggregation::Provider::oldest_epoch(
                 &provider, namespace,
             ),
-            Some(epoch)
+            Some(verifier_epoch)
         );
         let _ = std::fs::remove_file(path);
     }
@@ -1133,14 +1187,25 @@ mod tests {
         assert!(restarted.scheme(Epoch::new(2)).is_none());
 
         assert_eq!(
-            retained_prune_epoch(Epoch::new(9), Ok(Some(Epoch::new(2)))),
+            retained_prune_epoch(Epoch::new(9), Ok(Some(Epoch::new(2))), Ok(None)),
             Epoch::new(2)
         );
         assert_eq!(
-            retained_prune_epoch(Epoch::new(9), Ok(Some(Epoch::new(3)))),
-            Epoch::new(3)
+            retained_prune_epoch(
+                Epoch::new(9),
+                Ok(Some(Epoch::new(3))),
+                Ok(Some(Epoch::new(2)))
+            ),
+            Epoch::new(2)
         );
-        assert_eq!(retained_prune_epoch(Epoch::new(9), Err(())), Epoch::zero());
+        assert_eq!(
+            retained_prune_epoch(Epoch::new(9), Ok(None), Ok(None)),
+            Epoch::new(9)
+        );
+        assert_eq!(
+            retained_prune_epoch(Epoch::new(9), Err(()), Ok(None)),
+            Epoch::zero()
+        );
         let _ = std::fs::remove_file(path);
     }
 }
