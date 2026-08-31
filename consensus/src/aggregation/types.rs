@@ -9,9 +9,7 @@ use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt, Write};
 use commonware_cryptography::{
     Digest, Hasher, Sha256,
-    certificate::{
-        AssemblyError, Attestation, Namespace as CertificateNamespace, Scheme, Subject,
-    },
+    certificate::{AssemblyError, Attestation, Namespace as CertificateNamespace, Scheme, Subject},
     sha256::Digest as Sha256Digest,
 };
 use commonware_parallel::Strategy;
@@ -372,8 +370,7 @@ impl<S: Scheme, D: Digest> Certificate<S, D> {
         let item = first.item.clone();
         let attestations = NonEmpty::new(
             first.attestation.clone(),
-            rest
-            .filter(|ack| ack.item == item)
+            rest.filter(|ack| ack.item == item)
                 .map(|ack| ack.attestation.clone()),
         );
         let certificate = scheme.assemble(attestations, strategy)?;
@@ -557,7 +554,6 @@ mod tests {
             Height::new(100),
             &Sequential,
         ));
-
     }
 
     #[test]

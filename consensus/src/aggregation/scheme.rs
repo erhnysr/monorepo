@@ -23,9 +23,7 @@ use commonware_cryptography::{Digest, certificate};
 /// This trait binds a [`certificate::Scheme`] to the [`Item`] subject type while
 /// retaining the certificate scheme's fault model. It is automatically implemented
 /// for any compatible scheme.
-pub trait Scheme<D: Digest>:
-    for<'a> certificate::Scheme<Subject<'a, D> = &'a Item<D>>
-{
+pub trait Scheme<D: Digest>: for<'a> certificate::Scheme<Subject<'a, D> = &'a Item<D>> {
     /// Returns the recovery identity derived from this scheme's signing namespace.
     fn recovery_namespace(&self) -> RecoveryNamespace;
 }
@@ -111,8 +109,8 @@ pub mod secp256r1 {
 
     impl_certificate_secp256r1!(&'a Item<D>, Namespace, N3f1);
 
-    impl<D: commonware_cryptography::Digest, P: commonware_cryptography::PublicKey>
-        super::Scheme<D> for Scheme<P>
+    impl<D: commonware_cryptography::Digest, P: commonware_cryptography::PublicKey> super::Scheme<D>
+        for Scheme<P>
     {
         fn recovery_namespace(&self) -> crate::aggregation::types::RecoveryNamespace {
             self.generic.namespace.recovery_namespace()

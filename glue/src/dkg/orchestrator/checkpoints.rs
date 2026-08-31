@@ -8,11 +8,7 @@ use commonware_actor::{
     mailbox::{self, Overflow, Policy, Sender},
 };
 use commonware_codec::Read;
-use commonware_consensus::{
-    Automaton, Block, Reporter,
-    marshal::Update,
-    types::Height,
-};
+use commonware_consensus::{Automaton, Block, Reporter, marshal::Update, types::Height};
 use commonware_cryptography::Digest;
 use commonware_macros::select_loop;
 use commonware_runtime::{ContextCell, Handle, Spawner, spawn_cell};
@@ -178,21 +174,15 @@ impl<B: FinalizedBlock, A: Acknowledgement> Automaton for Handler<B, A> {
 
     async fn propose(&mut self, height: Height) -> oneshot::Receiver<Self::Digest> {
         let (response, receiver) = oneshot::channel();
-        let _ = self
-            .sender
-            .enqueue(Message::Request {
-                height,
-                request: Request::Propose(response),
-                maximum: self.max_pending_requests,
-            });
+        let _ = self.sender.enqueue(Message::Request {
+            height,
+            request: Request::Propose(response),
+            maximum: self.max_pending_requests,
+        });
         receiver
     }
 
-    async fn verify(
-        &mut self,
-        height: Height,
-        digest: Self::Digest,
-    ) -> oneshot::Receiver<bool> {
+    async fn verify(&mut self, height: Height, digest: Self::Digest) -> oneshot::Receiver<bool> {
         let (response, receiver) = oneshot::channel();
         let _ = self.sender.enqueue(Message::Request {
             height,
@@ -341,13 +331,10 @@ mod tests {
     use crate::dkg::tests::mocks::MockBlock;
     use commonware_consensus::Heightable as _;
     use commonware_cryptography::{
-        Digestible as _, Hasher as _, Sha256,
-        sha256::Digest as Sha256Digest,
+        Digestible as _, Hasher as _, Sha256, sha256::Digest as Sha256Digest,
     };
     use commonware_runtime::{
-        Runner as _, Supervisor as _,
-        buffer::paged::CacheRef,
-        deterministic,
+        Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
     };
     use commonware_utils::{NZU16, NZU64, NZUsize, acknowledgement::Exact};
 
@@ -379,11 +366,7 @@ mod tests {
                 freezer_table_resize_frequency: 4,
                 freezer_table_resize_chunk_size: 32,
                 freezer_key_partition: "checkpoint_keys".into(),
-                freezer_key_page_cache: CacheRef::from_pooler(
-                    context,
-                    NZU16!(1024),
-                    NZUsize!(10),
-                ),
+                freezer_key_page_cache: CacheRef::from_pooler(context, NZU16!(1024), NZUsize!(10)),
                 freezer_value_partition: "checkpoint_values".into(),
                 freezer_value_target_size: 1024 * 1024,
                 freezer_value_compression: None,

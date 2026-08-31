@@ -17,8 +17,10 @@ use commonware_cryptography::{
     sha256::Digest as Sha256Digest,
 };
 use commonware_macros::test_traced;
-use commonware_p2p::{Message, Receiver as P2pReceiver, Recipients, Sender as _};
-use commonware_p2p::simulated::{Control, Link, Network, Oracle, Receiver, Sender};
+use commonware_p2p::{
+    Message, Receiver as P2pReceiver, Recipients, Sender as _,
+    simulated::{Control, Link, Network, Oracle, Receiver, Sender},
+};
 use commonware_parallel::Sequential;
 use commonware_runtime::{
     Clock, Quota, Runner, Spawner as _, Supervisor as _,
@@ -888,8 +890,7 @@ fn test_graceful_stop_reports_stopped() {
             },
         );
         let (engine, _mailbox) = Engine::new(context.child("engine"), cfg);
-        let (handle, stopper) =
-            engine.start_stoppable(registrations.remove(&participant).unwrap());
+        let (handle, stopper) = engine.start_stoppable(registrations.remove(&participant).unwrap());
 
         while !requested.lock().contains_key(&position) {
             context.sleep(Duration::from_millis(1)).await;
@@ -1020,8 +1021,7 @@ fn test_restart_reproposes_uncertified_position() {
         );
         restart_cfg.recovery_after_rebroadcasts = NonZeroU64::new(u64::MAX).unwrap();
         restart_cfg.recoverer = restart_recoverer;
-        let (restart_engine, _mailbox) =
-            Engine::new(context.child("restart_engine"), restart_cfg);
+        let (restart_engine, _mailbox) = Engine::new(context.child("restart_engine"), restart_cfg);
         let restart_handle = restart_engine.start(restart_registration);
 
         while !restart_requests.lock().contains_key(&position) {
@@ -1032,14 +1032,14 @@ fn test_restart_reproposes_uncertified_position() {
         }
         assert_eq!(
             restart_events.lock().as_slice(),
-            &[ (
+            &[(
                 true,
                 RecoveryKey {
                     namespace: RecoveryNamespace::derive(NAMESPACE),
                     epoch,
                     position,
                 },
-            ) ]
+            )]
         );
         let _replacement = oracle
             .control(participant)
@@ -1095,10 +1095,7 @@ where
                 .expect("first aggregation engine failed"),
             EngineOutcome::Completed
         );
-        assert_eq!(
-            first_certificates.lock().len(),
-            1
-        );
+        assert_eq!(first_certificates.lock().len(), 1);
 
         let (second_oracle, mut second_registrations) =
             simulation(context.child("second_simulation"), &fixture, false).await;
@@ -1129,10 +1126,7 @@ where
             EngineOutcome::Completed
         );
         assert!(replay_requests.lock().is_empty());
-        assert_eq!(
-            replay_certificates.lock().len(),
-            1
-        );
+        assert_eq!(replay_certificates.lock().len(), 1);
     });
 }
 
@@ -1204,8 +1198,7 @@ fn test_journal_facade_rejects_mismatch_and_destroys_exact_journal() {
         assert!(matches!(result, Err(JournalError::EpochMismatch)));
 
         let journal_context = context.child("verified");
-        let (journal, certificates) =
-            Journal::<_, scheme::ed25519::Scheme, Sha256Digest>::init(
+        let (journal, certificates) = Journal::<_, scheme::ed25519::Scheme, Sha256Digest>::init(
             journal_context,
             journal_cfg.clone(),
             &mut context,
@@ -1219,8 +1212,7 @@ fn test_journal_facade_rejects_mismatch_and_destroys_exact_journal() {
         journal.destroy().await.unwrap();
 
         let journal_context = context.child("after_destroy");
-        let (journal, certificates) =
-            Journal::<_, scheme::ed25519::Scheme, Sha256Digest>::init(
+        let (journal, certificates) = Journal::<_, scheme::ed25519::Scheme, Sha256Digest>::init(
             journal_context,
             journal_cfg,
             &mut context,

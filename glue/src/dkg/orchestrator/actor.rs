@@ -377,10 +377,7 @@ where
             debug!("context shutdown while resolving startup epoch");
             return;
         };
-        if let Err(error) = self
-            .track_retained_peer_sets(start.epoch, &epocher)
-            .await
-        {
+        if let Err(error) = self.track_retained_peer_sets(start.epoch, &epocher).await {
             warn!(
                 epoch = start.epoch.get(),
                 %error,
@@ -542,11 +539,8 @@ where
                 );
             }
 
-            self.manager.track(
-                epoch,
-                info.participants().tracked_peers(),
-                &info.directory,
-            )?;
+            self.manager
+                .track(epoch, info.participants().tracked_peers(), &info.directory)?;
             info!(%epoch, "activated retained epoch peer set");
         }
 

@@ -31,7 +31,10 @@ use commonware_utils::{
     non_empty,
     ordered::Quorum,
 };
-use futures::{Future, FutureExt as _, future::{self, Either}};
+use futures::{
+    Future, FutureExt as _,
+    future::{self, Either},
+};
 use rand_core::CryptoRng;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -193,13 +196,7 @@ where
         let mailbox = Mailbox { sender };
         let recovery_namespace = cfg.scheme.recovery_namespace();
         let journal_config = JournalConfig {
-            identity: JournalIdentity::new(
-                &cfg.scheme,
-                cfg.epoch,
-                cfg.first,
-                cfg.last,
-                cfg.window,
-            ),
+            identity: JournalIdentity::new(&cfg.scheme, cfg.epoch, cfg.first, cfg.last, cfg.window),
             partition: cfg.journal_partition,
             write_buffer: cfg.journal_write_buffer,
             replay_buffer: cfg.journal_replay_buffer,
@@ -502,10 +499,7 @@ where
         peer: &<S as Verifier>::PublicKey,
     ) -> Result<(), Error> {
         let position = ack.item.position;
-        if position < self.first
-            || position > self.last
-            || !self.pending.contains_key(&position)
-        {
+        if position < self.first || position > self.last || !self.pending.contains_key(&position) {
             return Err(Error::AckPosition(position));
         }
         let Some(signer) = self.scheme.participants().index(peer) else {
@@ -834,11 +828,7 @@ mod tests {
                     journal_replay_buffer: NZUsize!(4096),
                     journal_heights_per_section: NonZeroU64::new(4).unwrap(),
                     journal_compression: None,
-                    journal_page_cache: CacheRef::from_pooler(
-                        &context,
-                        NZU16!(1024),
-                        NZUsize!(10),
-                    ),
+                    journal_page_cache: CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10)),
                     strategy: Sequential,
                 },
             );

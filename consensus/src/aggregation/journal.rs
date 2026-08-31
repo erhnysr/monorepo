@@ -8,15 +8,11 @@ use crate::types::{Epoch, Height};
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt, Write};
 use commonware_cryptography::{
-    Digest, Hasher, Sha256,
-    certificate::Scheme as CertificateScheme,
+    Digest, Hasher, Sha256, certificate::Scheme as CertificateScheme,
     sha256::Digest as Sha256Digest,
 };
 use commonware_parallel::Strategy;
-use commonware_runtime::{
-    Metrics, ReadOptions, Storage,
-    buffer::paged::CacheRef,
-};
+use commonware_runtime::{Metrics, ReadOptions, Storage, buffer::paged::CacheRef};
 use commonware_storage::journal::{
     Error as StorageError,
     segmented::variable::{Config as StorageConfig, Journal as StorageJournal},
@@ -120,7 +116,9 @@ pub enum JournalError {
     #[error("aggregation journal last-position mismatch")]
     LastMismatch,
     /// The live-position window differs.
-    #[error("aggregation journal window mismatch; durably archive the complete range before replacing the journal")]
+    #[error(
+        "aggregation journal window mismatch; durably archive the complete range before replacing the journal"
+    )]
     WindowMismatch,
     /// A certificate does not belong to the configured scope or fails verification.
     #[error("aggregation journal certificate verification failed")]
@@ -365,7 +363,11 @@ where
 
     /// Destroys the exact, identity-checked journal represented by this handle.
     pub async fn destroy(mut self) -> Result<(), JournalError> {
-        self.inner.take().expect("journal unavailable").destroy().await?;
+        self.inner
+            .take()
+            .expect("journal unavailable")
+            .destroy()
+            .await?;
         Ok(())
     }
 }

@@ -5,9 +5,7 @@
 //! certificates, and destroys the journal only after history authorizes the
 //! exact retirement.
 
-use super::aggregation::{
-    ArchiveStatus, Cleanup, Handler, Provider, RequestError, Retirement,
-};
+use super::aggregation::{ArchiveStatus, Cleanup, Handler, Provider, RequestError, Retirement};
 use commonware_codec::Encode as _;
 use commonware_consensus::{
     aggregation::{
