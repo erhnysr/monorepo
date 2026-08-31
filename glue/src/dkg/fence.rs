@@ -50,6 +50,7 @@ impl Drop for Fence {
     }
 }
 
+#[derive(Clone)]
 pub struct Gate {
     state: Arc<State>,
 }
