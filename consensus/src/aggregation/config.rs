@@ -35,8 +35,6 @@ pub struct Config<
     /// can still complete from a learned certificate or after restart.
     pub automaton: A,
     /// Receives certificates after the engine syncs them to its journal.
-    ///
-    /// Reporter feedback does not confirm archival durability.
     pub reporter: Z,
     /// Blocker for invalid network messages.
     pub blocker: B,

@@ -213,10 +213,7 @@ impl<S: CertificateScheme, D: Digest> Read for Record<S, D> {
         match u8::read(reader)? {
             0 => Ok(Self::Header(Header::read(reader)?)),
             1 => Ok(Self::Certificate(Certificate::read_cfg(reader, cfg)?)),
-            _ => Err(CodecError::Invalid(
-                "consensus::aggregation::journal::Record",
-                "invalid type",
-            )),
+            tag => Err(CodecError::InvalidEnum(tag)),
         }
     }
 }
