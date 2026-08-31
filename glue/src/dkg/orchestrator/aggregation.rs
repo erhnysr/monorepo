@@ -7,17 +7,19 @@
 //! it is sent only after the archive has synced.
 //!
 //! Retirement first syncs and semantically verifies every certificate in the
-//! authenticated epoch range. It then atomically persists an exact range marker,
-//! a journal-cleanup intent, and the namespace discovery floor. The cleanup
-//! intent survives a crash until the application confirms journal removal; this
-//! module deliberately does not guess how a private journal is named or stored.
+//! authenticated epoch range. It then atomically persists an exact range marker
+//! and journal-cleanup intent. The intent survives a crash until the application
+//! confirms journal removal, at which point the discovery floor may advance.
+//! This module deliberately does not guess how a private journal is named or stored.
 
 use bytes::{Buf, BufMut, Bytes};
 use commonware_actor::{
     Feedback,
     mailbox::{self, Overflow, Policy, Sender},
 };
-use commonware_codec::{Decode, Encode, EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
+use commonware_codec::{
+    Decode, Encode, EncodeSize, Error as CodecError, Read, ReadExt as _, Write,
+};
 use commonware_consensus::{
     aggregation::{
         scheme::Scheme,
@@ -45,11 +47,8 @@ use std::{
 };
 use thiserror::Error;
 
-type Archive<E, S, D> = immutable::Archive<
-    E,
-    commonware_cryptography::sha256::Digest,
-    Certificate<S, D>,
->;
+type Archive<E, S, D> =
+    immutable::Archive<E, commonware_cryptography::sha256::Digest, Certificate<S, D>>;
 
 /// Authenticated verification material for one epoch.
 #[derive(Clone)]
@@ -87,11 +86,7 @@ impl<S> AuthenticatedEpoch<S> {
 /// its namespace and epoch.
 pub trait Provider<S>: Clone + Send + Sync + 'static {
     /// Returns the authenticated scheme and range for `namespace` and `epoch`.
-    fn epoch(
-        &self,
-        namespace: RecoveryNamespace,
-        epoch: Epoch,
-    ) -> Option<AuthenticatedEpoch<S>>;
+    fn epoch(&self, namespace: RecoveryNamespace, epoch: Epoch) -> Option<AuthenticatedEpoch<S>>;
 
     /// Returns the first epoch that may still require discovery.
     ///
@@ -184,10 +179,18 @@ enum MetadataKey {
 impl Display for MetadataKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Marker(r) => write!(f, "marker/{}/{}/{}/{}", r.namespace, r.epoch, r.first, r.last),
+            Self::Marker(r) => write!(
+                f,
+                "marker/{}/{}/{}/{}",
+                r.namespace, r.epoch, r.first, r.last
+            ),
             Self::Floor(namespace) => write!(f, "floor/{namespace}"),
             Self::Cleanup(r) => {
-                write!(f, "cleanup/{}/{}/{}/{}", r.namespace, r.epoch, r.first, r.last)
+                write!(
+                    f,
+                    "cleanup/{}/{}/{}/{}",
+                    r.namespace, r.epoch, r.first, r.last
+                )
             }
         }
     }
@@ -314,9 +317,12 @@ impl DeliveryResponse {
     }
 
     fn send(mut self, outcome: Outcome) {
-        let _ = self.0.take().expect("delivery response missing").send(outcome);
+        let _ = self
+            .0
+            .take()
+            .expect("delivery response missing")
+            .send(outcome);
     }
-
 }
 
 impl Drop for DeliveryResponse {
@@ -412,7 +418,11 @@ impl Handler {
         value: Bytes,
     ) -> Result<ArchiveStatus, RequestError> {
         let (response, receiver) = oneshot::channel();
-        let feedback = self.sender.enqueue(Message::Archive { key, value, response });
+        let feedback = self.sender.enqueue(Message::Archive {
+            key,
+            value,
+            response,
+        });
         receive(feedback, receiver).await
     }
 
@@ -424,7 +434,10 @@ impl Handler {
         retirement: Retirement,
     ) -> Result<Option<Cleanup>, RequestError> {
         let (response, receiver) = oneshot::channel();
-        let feedback = self.sender.enqueue(Message::Retire { retirement, response });
+        let feedback = self.sender.enqueue(Message::Retire {
+            retirement,
+            response,
+        });
         receive(feedback, receiver).await
     }
 
@@ -434,7 +447,10 @@ impl Handler {
         namespace: RecoveryNamespace,
     ) -> Result<Option<Epoch>, RequestError> {
         let (response, receiver) = oneshot::channel();
-        let feedback = self.sender.enqueue(Message::Oldest { namespace, response });
+        let feedback = self.sender.enqueue(Message::Oldest {
+            namespace,
+            response,
+        });
         receive(feedback, receiver).await
     }
 
@@ -479,10 +495,7 @@ impl Handler {
     }
 
     /// Confirms removal of the journal named by a durable cleanup intent.
-    pub async fn cleanup_complete(
-        &mut self,
-        retirement: Retirement,
-    ) -> Result<bool, RequestError> {
+    pub async fn cleanup_complete(&mut self, retirement: Retirement) -> Result<bool, RequestError> {
         let (response, receiver) = oneshot::channel();
         let feedback = self.sender.enqueue(Message::CleanupComplete {
             retirement,
@@ -492,10 +505,7 @@ impl Handler {
     }
 }
 
-async fn receive<T>(
-    feedback: Feedback,
-    receiver: oneshot::Receiver<T>,
-) -> Result<T, RequestError> {
+async fn receive<T>(feedback: Feedback, receiver: oneshot::Receiver<T>) -> Result<T, RequestError> {
     match feedback {
         Feedback::Ok => receiver.await.map_err(|_| RequestError::Closed),
         Feedback::Backoff => Err(RequestError::Backpressured),
@@ -656,11 +666,7 @@ where
             .then_some(epoch)
     }
 
-    fn decode_verify(
-        &mut self,
-        key: RecoveryKey,
-        value: &Bytes,
-    ) -> Option<Certificate<S, D>> {
+    fn decode_verify(&mut self, key: RecoveryKey, value: &Bytes) -> Option<Certificate<S, D>> {
         let epoch = self.authenticated(key)?;
         let certificate = Certificate::<S, D>::decode_cfg(
             value.clone(),
@@ -720,10 +726,7 @@ where
         if retirement.namespace != self.namespace {
             return Ok(None);
         }
-        let Some(epoch) = self
-            .provider
-            .epoch(retirement.namespace, retirement.epoch)
-        else {
+        let Some(epoch) = self.provider.epoch(retirement.namespace, retirement.epoch) else {
             return Ok(None);
         };
         if epoch.scheme.recovery_namespace() != retirement.namespace
@@ -769,47 +772,6 @@ where
         let mut metadata = self.metadata.take().expect("metadata unavailable");
         metadata.put(marker, MetadataValue::Marker);
         metadata.put(MetadataKey::Cleanup(retirement), MetadataValue::Marker);
-        let mut floor = match metadata.get(&MetadataKey::Floor(retirement.namespace)) {
-            Some(MetadataValue::Floor(epoch)) => Some(*epoch),
-            Some(MetadataValue::Exhausted) => None,
-            Some(MetadataValue::Marker) | None => {
-                self.provider.oldest_epoch(retirement.namespace)
-            }
-        };
-
-        let mut exhausted = false;
-
-        while let Some(current) = floor {
-            let Some(current_epoch) = self.provider.epoch(retirement.namespace, current) else {
-                break;
-            };
-            let exact = Retirement {
-                namespace: retirement.namespace,
-                epoch: current,
-                first: current_epoch.first,
-                last: current_epoch.last,
-            };
-            if metadata.get(&MetadataKey::Marker(exact)).is_none() {
-                break;
-            }
-            if current.get() == u64::MAX {
-                exhausted = true;
-                floor = None;
-                break;
-            }
-            floor = Some(Epoch::new(current.get() + 1));
-        }
-        if exhausted {
-            metadata.put(
-                MetadataKey::Floor(retirement.namespace),
-                MetadataValue::Exhausted,
-            );
-        } else if let Some(floor) = floor {
-            metadata.put(
-                MetadataKey::Floor(retirement.namespace),
-                MetadataValue::Floor(floor),
-            );
-        }
         self.metadata = Some(metadata.sync().await?);
         Ok(Some(Cleanup { retirement }))
     }
@@ -840,18 +802,11 @@ where
                 .is_some()
     }
 
-    fn missing_heights(
-        &self,
-        retirement: Retirement,
-        maximum: NonZeroUsize,
-    ) -> Vec<Height> {
+    fn missing_heights(&self, retirement: Retirement, maximum: NonZeroUsize) -> Vec<Height> {
         if retirement.namespace != self.namespace || self.is_retired(retirement) {
             return Vec::new();
         }
-        let Some(epoch) = self
-            .provider
-            .epoch(retirement.namespace, retirement.epoch)
-        else {
+        let Some(epoch) = self.provider.epoch(retirement.namespace, retirement.epoch) else {
             return Vec::new();
         };
         if epoch.scheme.recovery_namespace() != retirement.namespace
@@ -930,11 +885,49 @@ where
         let mut metadata = self.metadata.take().expect("metadata unavailable");
         let removed = metadata.remove(&key).is_some();
         self.metadata = Some(if removed {
+            self.advance_floor(&mut metadata, retirement.namespace);
             metadata.sync().await?
         } else {
             metadata
         });
         Ok(removed)
+    }
+
+    fn advance_floor(
+        &self,
+        metadata: &mut metadata::Metadata<E, MetadataKey, MetadataValue>,
+        namespace: RecoveryNamespace,
+    ) {
+        let mut floor = match metadata.get(&MetadataKey::Floor(namespace)) {
+            Some(MetadataValue::Floor(epoch)) => Some(*epoch),
+            Some(MetadataValue::Exhausted) => return,
+            Some(MetadataValue::Marker) | None => self.provider.oldest_epoch(namespace),
+        };
+        while let Some(current) = floor {
+            let Some(current_epoch) = self.provider.epoch(namespace, current) else {
+                break;
+            };
+            let exact = Retirement {
+                namespace,
+                epoch: current,
+                first: current_epoch.first,
+                last: current_epoch.last,
+            };
+            if metadata.get(&MetadataKey::Marker(exact)).is_none()
+                || metadata.get(&MetadataKey::Cleanup(exact)).is_some()
+            {
+                break;
+            }
+            if current.get() == u64::MAX {
+                floor = None;
+                break;
+            }
+            floor = Some(Epoch::new(current.get() + 1));
+        }
+        metadata.put(
+            MetadataKey::Floor(namespace),
+            floor.map_or(MetadataValue::Exhausted, MetadataValue::Floor),
+        );
     }
 }
 
@@ -984,8 +977,9 @@ mod tests {
         context: &deterministic::Context,
         namespace: RecoveryNamespace,
         codec_config: <<TestScheme as commonware_cryptography::certificate::Verifier>::Certificate as Read>::Cfg,
-    ) -> Config<<<TestScheme as commonware_cryptography::certificate::Verifier>::Certificate as Read>::Cfg>
-    {
+    ) -> Config<
+        <<TestScheme as commonware_cryptography::certificate::Verifier>::Certificate as Read>::Cfg,
+    > {
         Config {
             namespace,
             archive: immutable::Config {
@@ -1042,13 +1036,7 @@ mod tests {
             .iter()
             .filter_map(|index| Ack::sign(&schemes[*index], item.clone()))
             .collect();
-        Certificate::from_acks(
-            &schemes[0],
-            epoch,
-            non_empty![@acks.iter()],
-            &Sequential,
-        )
-        .unwrap()
+        Certificate::from_acks(&schemes[0], epoch, non_empty![@acks.iter()], &Sequential).unwrap()
     }
 
     fn key(namespace: RecoveryNamespace, epoch: u64, position: u64) -> RecoveryKey {
@@ -1123,31 +1111,29 @@ mod tests {
             let ten = certificate(&schemes, Epoch::new(1), Height::new(10)).encode();
             assert_eq!(
                 handler
-                    .archive(
-                        key(RecoveryNamespace::derive(b"other"), 1, 10),
-                        ten.clone(),
-                    )
+                    .archive(key(RecoveryNamespace::derive(b"other"), 1, 10), ten.clone(),)
                     .await
                     .unwrap(),
                 ArchiveStatus::Rejected
             );
             assert_eq!(
-                handler.archive(key(namespace, 1, 10), ten.clone()).await.unwrap(),
+                handler
+                    .archive(key(namespace, 1, 10), ten.clone())
+                    .await
+                    .unwrap(),
                 ArchiveStatus::Stored
             );
             assert_eq!(
-                handler.archive(key(namespace, 1, 10), ten.clone()).await.unwrap(),
+                handler
+                    .archive(key(namespace, 1, 10), ten.clone())
+                    .await
+                    .unwrap(),
                 ArchiveStatus::Duplicate
             );
 
             // Different valid quorum encodings satisfy the same resolver key.
-            let alternate_ten = certificate_from(
-                &schemes,
-                &[0, 1, 3],
-                Epoch::new(1),
-                Height::new(10),
-            )
-            .encode();
+            let alternate_ten =
+                certificate_from(&schemes, &[0, 1, 3], Epoch::new(1), Height::new(10)).encode();
             let delivery = Delivery {
                 key: key(namespace, 1, 10),
                 subscribers: non_empty_vec![((), tracing::Span::none())],
@@ -1187,7 +1173,10 @@ mod tests {
             // A future exact marker does not skip the oldest unretired epoch.
             let twelve = certificate(&schemes, Epoch::new(2), Height::new(12)).encode();
             assert_eq!(
-                handler.archive(key(namespace, 2, 12), twelve).await.unwrap(),
+                handler
+                    .archive(key(namespace, 2, 12), twelve)
+                    .await
+                    .unwrap(),
                 ArchiveStatus::Stored
             );
             let epoch_two = Retirement {
@@ -1198,7 +1187,9 @@ mod tests {
             };
             assert_eq!(
                 handler.retire(epoch_two).await.unwrap(),
-                Some(Cleanup { retirement: epoch_two })
+                Some(Cleanup {
+                    retirement: epoch_two
+                })
             );
             assert!(handler.retired(epoch_two).await.unwrap());
             assert!(!handler.retired(epoch_one).await.unwrap());
@@ -1208,20 +1199,27 @@ mod tests {
             );
             assert_eq!(
                 handler.retire(epoch_one).await.unwrap(),
-                Some(Cleanup { retirement: epoch_one })
+                Some(Cleanup {
+                    retirement: epoch_one
+                })
             );
             assert_eq!(
                 handler.oldest_unretired(namespace).await.unwrap(),
-                Some(Epoch::new(3))
+                Some(Epoch::new(1))
             );
             assert!(handler.retired(epoch_one).await.unwrap());
-            assert!(handler
-                .missing(epoch_one, NZUsize!(10))
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                handler
+                    .missing(epoch_one, NZUsize!(10))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(
-                handler.pending_cleanups(namespace, NZUsize!(10)).await.unwrap(),
+                handler
+                    .pending_cleanups(namespace, NZUsize!(10))
+                    .await
+                    .unwrap(),
                 vec![
                     Cleanup {
                         retirement: epoch_one
@@ -1246,7 +1244,7 @@ mod tests {
             let task = actor.start();
             assert_eq!(
                 handler.oldest_unretired(namespace).await.unwrap(),
-                Some(Epoch::new(3))
+                Some(Epoch::new(1))
             );
             assert_eq!(
                 Producer::produce(&mut handler, key(namespace, 1, 10))
@@ -1255,7 +1253,10 @@ mod tests {
                 ten
             );
             assert_eq!(
-                handler.pending_cleanups(namespace, NZUsize!(10)).await.unwrap(),
+                handler
+                    .pending_cleanups(namespace, NZUsize!(10))
+                    .await
+                    .unwrap(),
                 vec![
                     Cleanup {
                         retirement: epoch_one
@@ -1268,10 +1269,22 @@ mod tests {
             assert!(handler.cleanup_complete(epoch_one).await.unwrap());
             assert!(!handler.cleanup_complete(epoch_one).await.unwrap());
             assert_eq!(
-                handler.pending_cleanups(namespace, NZUsize!(10)).await.unwrap(),
+                handler.oldest_unretired(namespace).await.unwrap(),
+                Some(Epoch::new(2))
+            );
+            assert_eq!(
+                handler
+                    .pending_cleanups(namespace, NZUsize!(10))
+                    .await
+                    .unwrap(),
                 vec![Cleanup {
                     retirement: epoch_two
                 }]
+            );
+            assert!(handler.cleanup_complete(epoch_two).await.unwrap());
+            assert_eq!(
+                handler.oldest_unretired(namespace).await.unwrap(),
+                Some(Epoch::new(3))
             );
             context.child("stop").stop(0, None).await.unwrap();
             task.await.unwrap().unwrap();
@@ -1358,6 +1371,11 @@ mod tests {
                 handler.retire(retirement).await.unwrap(),
                 Some(Cleanup { retirement })
             );
+            assert_eq!(
+                handler.oldest_unretired(namespace).await.unwrap(),
+                Some(terminal)
+            );
+            assert!(handler.cleanup_complete(retirement).await.unwrap());
             assert_eq!(handler.oldest_unretired(namespace).await.unwrap(), None);
             drop(handler);
             task.await.unwrap().unwrap();
