@@ -7,10 +7,10 @@
 //! it is sent only after the archive has synced.
 //!
 //! Retirement first syncs and semantically verifies every certificate in the
-//! authenticated epoch range. It then persists an exact range marker and the
-//! namespace discovery floor atomically. Only the returned [`Cleanup`] permits
-//! the application to remove its aggregation journal; this module deliberately
-//! does not guess how a private journal is named or stored.
+//! authenticated epoch range. It then atomically persists an exact range marker,
+//! a journal-cleanup intent, and the namespace discovery floor. The cleanup
+//! intent survives a crash until the application confirms journal removal; this
+//! module deliberately does not guess how a private journal is named or stored.
 
 use bytes::{Buf, BufMut, Bytes};
 use commonware_actor::{
@@ -178,6 +178,7 @@ pub struct Config<C> {
 enum MetadataKey {
     Marker(Retirement),
     Floor(RecoveryNamespace),
+    Cleanup(Retirement),
 }
 
 impl Display for MetadataKey {
@@ -185,6 +186,9 @@ impl Display for MetadataKey {
         match self {
             Self::Marker(r) => write!(f, "marker/{}/{}/{}/{}", r.namespace, r.epoch, r.first, r.last),
             Self::Floor(namespace) => write!(f, "floor/{namespace}"),
+            Self::Cleanup(r) => {
+                write!(f, "cleanup/{}/{}/{}/{}", r.namespace, r.epoch, r.first, r.last)
+            }
         }
     }
 }
@@ -203,6 +207,13 @@ impl Write for MetadataKey {
                 1u8.write(buf);
                 namespace.write(buf);
             }
+            Self::Cleanup(r) => {
+                2u8.write(buf);
+                r.namespace.write(buf);
+                r.epoch.write(buf);
+                r.first.write(buf);
+                r.last.write(buf);
+            }
         }
     }
 }
@@ -219,6 +230,12 @@ impl Read for MetadataKey {
                 last: Height::read(buf)?,
             })),
             1 => Ok(Self::Floor(RecoveryNamespace::read(buf)?)),
+            2 => Ok(Self::Cleanup(Retirement {
+                namespace: RecoveryNamespace::read(buf)?,
+                epoch: Epoch::read(buf)?,
+                first: Height::read(buf)?,
+                last: Height::read(buf)?,
+            })),
             tag => Err(CodecError::InvalidEnum(tag)),
         }
     }
@@ -234,6 +251,12 @@ impl EncodeSize for MetadataKey {
                     + r.last.encode_size()
             }
             Self::Floor(namespace) => namespace.encode_size(),
+            Self::Cleanup(r) => {
+                r.namespace.encode_size()
+                    + r.epoch.encode_size()
+                    + r.first.encode_size()
+                    + r.last.encode_size()
+            }
         }
     }
 }
@@ -336,6 +359,15 @@ enum Message {
         maximum: NonZeroUsize,
         response: oneshot::Sender<Vec<Height>>,
     },
+    PendingCleanups {
+        namespace: RecoveryNamespace,
+        maximum: NonZeroUsize,
+        response: oneshot::Sender<Vec<Cleanup>>,
+    },
+    CleanupComplete {
+        retirement: Retirement,
+        response: oneshot::Sender<bool>,
+    },
 }
 
 #[derive(Default)]
@@ -426,6 +458,34 @@ impl Handler {
         let feedback = self.sender.enqueue(Message::Missing {
             retirement,
             maximum,
+            response,
+        });
+        receive(feedback, receiver).await
+    }
+
+    /// Returns durable journal-cleanup intents in epoch order.
+    pub async fn pending_cleanups(
+        &mut self,
+        namespace: RecoveryNamespace,
+        maximum: NonZeroUsize,
+    ) -> Result<Vec<Cleanup>, RequestError> {
+        let (response, receiver) = oneshot::channel();
+        let feedback = self.sender.enqueue(Message::PendingCleanups {
+            namespace,
+            maximum,
+            response,
+        });
+        receive(feedback, receiver).await
+    }
+
+    /// Confirms removal of the journal named by a durable cleanup intent.
+    pub async fn cleanup_complete(
+        &mut self,
+        retirement: Retirement,
+    ) -> Result<bool, RequestError> {
+        let (response, receiver) = oneshot::channel();
+        let feedback = self.sender.enqueue(Message::CleanupComplete {
+            retirement,
             response,
         });
         receive(feedback, receiver).await
@@ -573,6 +633,13 @@ where
                 Message::Missing { retirement, maximum, response } => {
                     let _ = response.send(self.missing_heights(retirement, maximum));
                 }
+                Message::PendingCleanups { namespace, maximum, response } => {
+                    let _ = response.send(self.pending_cleanups(namespace, maximum));
+                }
+                Message::CleanupComplete { retirement, response } => {
+                    let completed = self.cleanup_complete(retirement).await?;
+                    let _ = response.send(completed);
+                }
             },
         }
         Ok(())
@@ -701,6 +768,7 @@ where
         let marker = MetadataKey::Marker(retirement);
         let mut metadata = self.metadata.take().expect("metadata unavailable");
         metadata.put(marker, MetadataValue::Marker);
+        metadata.put(MetadataKey::Cleanup(retirement), MetadataValue::Marker);
         let mut floor = match metadata.get(&MetadataKey::Floor(retirement.namespace)) {
             Some(MetadataValue::Floor(epoch)) => Some(*epoch),
             Some(MetadataValue::Exhausted) => None,
@@ -828,6 +896,45 @@ where
             cursor = next;
         }
         missing
+    }
+
+    fn pending_cleanups(
+        &self,
+        namespace: RecoveryNamespace,
+        maximum: NonZeroUsize,
+    ) -> Vec<Cleanup> {
+        if namespace != self.namespace {
+            return Vec::new();
+        }
+        self.metadata
+            .as_ref()
+            .expect("metadata unavailable")
+            .keys()
+            .filter_map(|key| match key {
+                MetadataKey::Cleanup(retirement) if retirement.namespace == namespace => {
+                    Some(Cleanup {
+                        retirement: *retirement,
+                    })
+                }
+                _ => None,
+            })
+            .take(maximum.get())
+            .collect()
+    }
+
+    async fn cleanup_complete(&mut self, retirement: Retirement) -> Result<bool, Error> {
+        if retirement.namespace != self.namespace {
+            return Ok(false);
+        }
+        let key = MetadataKey::Cleanup(retirement);
+        let mut metadata = self.metadata.take().expect("metadata unavailable");
+        let removed = metadata.remove(&key).is_some();
+        self.metadata = Some(if removed {
+            metadata.sync().await?
+        } else {
+            metadata
+        });
+        Ok(removed)
     }
 }
 
@@ -1113,6 +1220,17 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty());
+            assert_eq!(
+                handler.pending_cleanups(namespace, NZUsize!(10)).await.unwrap(),
+                vec![
+                    Cleanup {
+                        retirement: epoch_one
+                    },
+                    Cleanup {
+                        retirement: epoch_two
+                    }
+                ]
+            );
 
             // Crossing both durability boundaries survives actor restart.
             drop(handler);
@@ -1135,6 +1253,25 @@ mod tests {
                     .await
                     .unwrap(),
                 ten
+            );
+            assert_eq!(
+                handler.pending_cleanups(namespace, NZUsize!(10)).await.unwrap(),
+                vec![
+                    Cleanup {
+                        retirement: epoch_one
+                    },
+                    Cleanup {
+                        retirement: epoch_two
+                    }
+                ]
+            );
+            assert!(handler.cleanup_complete(epoch_one).await.unwrap());
+            assert!(!handler.cleanup_complete(epoch_one).await.unwrap());
+            assert_eq!(
+                handler.pending_cleanups(namespace, NZUsize!(10)).await.unwrap(),
+                vec![Cleanup {
+                    retirement: epoch_two
+                }]
             );
             context.child("stop").stop(0, None).await.unwrap();
             task.await.unwrap().unwrap();

@@ -148,10 +148,49 @@ where
             retirement: authorized,
         }) if authorized == retirement => {
             journal.destroy().await?;
-            Ok(Outcome::Retired)
+            match history.cleanup_complete(retirement).await {
+                Ok(true) => Ok(Outcome::Retired),
+                Ok(false) => Err(Error::CleanupMismatch),
+                Err(RequestError::Backpressured) => Err(Error::HistoryBackpressured),
+                Err(RequestError::Closed) => Err(Error::HistoryUnavailable),
+            }
         }
         Some(_) => Err(Error::CleanupMismatch),
         None => Ok(Outcome::Parked),
+    }
+}
+
+/// Completes a durable cleanup intent without running certificate recovery.
+pub async fn cleanup<E, S, D, V, T>(
+    storage: E,
+    journal_config: JournalConfig,
+    verifier: &mut V,
+    scheme: &S,
+    strategy: &T,
+    history: &mut Handler,
+) -> Result<(), Error>
+where
+    E: Storage + Metrics,
+    S: Scheme<D>,
+    D: Digest,
+    V: CryptoRng,
+    T: Strategy,
+{
+    let (journal, _) =
+        Journal::<E, S, D>::init(storage, journal_config, verifier, scheme, strategy).await?;
+    let identity = journal.identity();
+    let retirement = Retirement {
+        namespace: identity.namespace,
+        epoch: identity.epoch,
+        first: identity.first,
+        last: identity.last,
+    };
+    journal.destroy().await?;
+    match history.cleanup_complete(retirement).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Error::CleanupMismatch),
+        Err(RequestError::Backpressured) => Err(Error::HistoryBackpressured),
+        Err(RequestError::Closed) => Err(Error::HistoryUnavailable),
     }
 }
 
