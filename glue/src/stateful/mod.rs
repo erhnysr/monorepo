@@ -135,6 +135,16 @@ pub struct Input<Upstream, Provider> {
     pub provider: Provider,
 }
 
+/// Describes how a finalized block reached the applied database state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Finalized<T> {
+    /// The block's winning batches were captured and applied.
+    Applied(T),
+
+    /// The block was already reflected without winning batches to capture.
+    Synchronized,
+}
+
 /// A stateful application whose storage is managed by a [`DatabaseSet`].
 ///
 /// Implementors receive [`DatabaseSet::Unmerkleized`] batches and
@@ -173,6 +183,9 @@ where
 
     /// The set of databases managed on behalf of this application.
     type Databases: DatabaseSet<E>;
+
+    /// Owned data captured from winning batches before they are applied.
+    type FinalizedArtifact: Send + 'static;
 
     /// The stateful-owned provider, supplied through
     /// [`Config::provider`](crate::stateful::Config::provider).
@@ -305,6 +318,21 @@ where
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> impl Future<Output = <Self::Databases as DatabaseSet<E>>::Merkleized> + Send;
 
+    /// Capture data from winning batches before they are applied.
+    ///
+    /// `readers` observe the database state before `batches`. The returned
+    /// artifact is passed unchanged to [`finalized`](Self::finalized) after
+    /// the batches are applied. This runs on the finalization critical path
+    /// before [`DatabaseSet::apply`]. Keep it cheap and defer expensive
+    /// derivation until after the artifact is handed off.
+    fn capture_finalized(
+        &mut self,
+        context: (E, Self::Context),
+        block: &Self::Block,
+        batches: &<Self::Databases as DatabaseSet<E>>::Merkleized,
+        readers: <Self::Databases as DatabaseSet<E>>::Readers,
+    ) -> impl Future<Output = Self::FinalizedArtifact> + Send;
+
     /// Observe a finalized block after it is reflected in the database set.
     ///
     /// Once the database set is ready, the wrapper calls this for every
@@ -315,7 +343,12 @@ where
     /// be pending. When an earlier database sync is active, the sync covering
     /// this block may not have started yet. Blocks already reflected by startup
     /// reconciliation or completed state sync are reported without reapplying
-    /// them.
+    /// them. After a restart, marshal may redeliver an already-reflected block
+    /// as [`Finalized::Synchronized`].
+    ///
+    /// [`Finalized::Applied`] carries the artifact captured from the exact
+    /// batches applied for this notification. [`Finalized::Synchronized`]
+    /// means no winning batches were available and no artifact was rebuilt.
     ///
     /// During peer state sync, a finalized block may be absorbed into a recorded sync target and
     /// acknowledged without invoking this hook. Blocks still pending when sync completes are
@@ -339,6 +372,7 @@ where
         &mut self,
         _context: (E, Self::Context),
         _block: &Self::Block,
+        _provenance: Finalized<Self::FinalizedArtifact>,
         _readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) -> impl Future<Output = ()> + Send {
         async {}

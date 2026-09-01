@@ -1,5 +1,5 @@
 use crate::stateful::{
-    Application, Input,
+    Application, Finalized, Input,
     actor::{
         core::{
             mailbox::Message,
@@ -419,6 +419,7 @@ where
                                 .drive(self.processor.notify_finalized(
                                     self.context.as_present(),
                                     block.as_ref(),
+                                    Finalized::Synchronized,
                                 ))
                                 .await;
                             acknowledgement.acknowledge();
@@ -432,15 +433,10 @@ where
                             .await;
                         drop(boundary);
                         async {
-                            let should_start_sync = durability.sync.is_none();
                             let applied = verifications
-                                .drive(self.processor.finalize(
-                                    &self.context,
-                                    block.as_ref(),
-                                    should_start_sync,
-                                ))
+                                .drive(self.processor.finalize(&self.context, block.as_ref()))
                                 .await;
-                            let Some(Applied { barrier, prune }) = applied else {
+                            let Some(Applied { prune }) = applied else {
                                 // Duplicate report: marshal redelivers a processed
                                 // height only after a restart, where startup aligned
                                 // the databases to durable state.
@@ -459,9 +455,6 @@ where
                             // leaves the suffix unacknowledged for restart replay.
                             let height = block.height();
                             durability.applied(height, acknowledgement);
-                            if let Some(barrier) = barrier {
-                                durability.started(height, barrier);
-                            }
 
                             // Defer pruning to the loop so it can settle durability and quiesce
                             // verification readers at one database mutation boundary.
@@ -552,7 +545,7 @@ fn skip_finalized_block(skip_until: &mut Option<Height>, height: Height) -> bool
 mod tests {
     use super::{Message, Processing, VerificationRequest, skip_finalized_block};
     use crate::stateful::{
-        Application, Input, Proposed, PruneConfig,
+        Application, Finalized, Input, Proposed, PruneConfig,
         actor::{
             core::mailbox::Mailbox,
             metrics::Metrics as StatefulMetrics,
@@ -616,6 +609,7 @@ mod tests {
         type Context = <TestApp as Application<deterministic::Context>>::Context;
         type Block = TestBlock;
         type Databases = TestDatabases;
+        type FinalizedArtifact = ();
         type Provider = ();
         type Input = ();
 
@@ -669,6 +663,15 @@ mod tests {
         ) -> TestMerkleized {
             TestMerkleized
         }
+
+        async fn capture_finalized(
+            &mut self,
+            _context: (deterministic::Context, Self::Context),
+            _block: &Self::Block,
+            _batches: &TestMerkleized,
+            _readers: <Self::Databases as DatabaseSet<deterministic::Context>>::Readers,
+        ) {
+        }
     }
 
     #[derive(Clone)]
@@ -683,6 +686,7 @@ mod tests {
         type Context = <TestApp as Application<deterministic::Context>>::Context;
         type Block = TestBlock;
         type Databases = TestDatabases;
+        type FinalizedArtifact = ();
         type Provider = ();
         type Input = ();
 
@@ -733,6 +737,15 @@ mod tests {
         ) -> TestMerkleized {
             TestMerkleized
         }
+
+        async fn capture_finalized(
+            &mut self,
+            _context: (deterministic::Context, Self::Context),
+            _block: &Self::Block,
+            _batches: &TestMerkleized,
+            _readers: <Self::Databases as DatabaseSet<deterministic::Context>>::Readers,
+        ) {
+        }
     }
 
     #[derive(Clone)]
@@ -743,6 +756,7 @@ mod tests {
         gate_height: Height,
         apply_calls: Arc<AtomicUsize>,
         verify_calls: Arc<AtomicUsize>,
+        synchronized_finalizations: Arc<AtomicUsize>,
     }
 
     impl Application<deterministic::Context> for ReplayGatedApp {
@@ -750,6 +764,7 @@ mod tests {
         type Context = <TestApp as Application<deterministic::Context>>::Context;
         type Block = TestBlock;
         type Databases = TestDatabases;
+        type FinalizedArtifact = ();
         type Provider = ();
         type Input = ();
 
@@ -803,12 +818,26 @@ mod tests {
             TestMerkleized
         }
 
+        async fn capture_finalized(
+            &mut self,
+            _context: (deterministic::Context, Self::Context),
+            _block: &Self::Block,
+            _batches: &TestMerkleized,
+            _readers: <Self::Databases as DatabaseSet<deterministic::Context>>::Readers,
+        ) {
+        }
+
         async fn finalized(
             &mut self,
             _context: (deterministic::Context, Self::Context),
             _block: &Self::Block,
+            provenance: Finalized<Self::FinalizedArtifact>,
             _readers: <Self::Databases as DatabaseSet<deterministic::Context>>::Readers,
         ) {
+            if matches!(provenance, Finalized::Synchronized) {
+                self.synchronized_finalizations
+                    .fetch_add(1, Ordering::SeqCst);
+            }
             let gate = self.finalized_gate.lock().take();
             if let Some(mut gate) = gate {
                 let _ = gate.started.send(());
@@ -1703,6 +1732,7 @@ mod tests {
             .await;
             let (verify_gate, verify_started, verify_release) = application_gate();
             let (finalized_gate, finalized_started, finalized_release) = application_gate();
+            let synchronized_finalizations = Arc::new(AtomicUsize::new(0));
             let app = ReplayGatedApp {
                 gates: Arc::new(Mutex::new(VecDeque::new())),
                 verify_gate: Arc::new(Mutex::new(Some(verify_gate))),
@@ -1710,6 +1740,7 @@ mod tests {
                 gate_height: finalized.height(),
                 apply_calls: Arc::new(AtomicUsize::new(0)),
                 verify_calls: Arc::new(AtomicUsize::new(0)),
+                synchronized_finalizations: synchronized_finalizations.clone(),
             };
             let processor = Processor::new(
                 app,
@@ -1767,6 +1798,7 @@ mod tests {
             actor.abort();
             drop(marshal.guards);
             assert!(valid);
+            assert_eq!(synchronized_finalizations.load(Ordering::SeqCst), 1);
             assert!(
                 result.is_some(),
                 "skipped finalization stalled a retained verification",
@@ -1893,6 +1925,7 @@ mod tests {
                 gate_height: parent.height(),
                 apply_calls: apply_calls.clone(),
                 verify_calls: verify_calls.clone(),
+                synchronized_finalizations: Arc::new(AtomicUsize::new(0)),
             };
             let processor = Processor::new(
                 app,
@@ -1991,6 +2024,7 @@ mod tests {
                 gate_height: finalized.height(),
                 apply_calls: apply_calls.clone(),
                 verify_calls: verify_calls.clone(),
+                synchronized_finalizations: Arc::new(AtomicUsize::new(0)),
             };
             let processor = Processor::new(
                 app,
@@ -2084,6 +2118,7 @@ mod tests {
                 gate_height: first.height(),
                 apply_calls: apply_calls.clone(),
                 verify_calls: verify_calls.clone(),
+                synchronized_finalizations: Arc::new(AtomicUsize::new(0)),
             };
             let processor = Processor::new(
                 app,
@@ -2190,6 +2225,7 @@ mod tests {
                 gate_height: first.height(),
                 apply_calls: Arc::new(AtomicUsize::new(0)),
                 verify_calls: Arc::new(AtomicUsize::new(0)),
+                synchronized_finalizations: Arc::new(AtomicUsize::new(0)),
             };
             let processor = Processor::new(
                 app,
@@ -2303,6 +2339,7 @@ mod tests {
                 gate_height: parent.height(),
                 apply_calls: apply_calls.clone(),
                 verify_calls: verify_calls.clone(),
+                synchronized_finalizations: Arc::new(AtomicUsize::new(0)),
             };
             let control = FlushControl::default();
             let (prune_started, prune_release) = control.gate_prune();

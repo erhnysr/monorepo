@@ -1,5 +1,5 @@
 use crate::stateful::{
-    Application,
+    Application, Finalized,
     actor::{
         core::{
             mailbox::Message, processing::Processing, verifications::Request as VerificationRequest,
@@ -334,13 +334,17 @@ where
                 FinalizedHandoff::Covered(block, acknowledgement)
                 | FinalizedHandoff::Reflected(block, acknowledgement) => {
                     processor
-                        .notify_finalized(self.context.as_present(), block.as_ref())
+                        .notify_finalized(
+                            self.context.as_present(),
+                            block.as_ref(),
+                            Finalized::Synchronized,
+                        )
                         .await;
                     acknowledgement.acknowledge();
                 }
                 FinalizedHandoff::Apply(block, acknowledgement) => {
-                    let Applied { prune, .. } = processor
-                        .finalize(self.context.as_present(), block.as_ref(), false)
+                    let Applied { prune } = processor
+                        .finalize(self.context.as_present(), block.as_ref())
                         .await
                         .expect("sync handoff block cannot be a duplicate");
                     pending_acknowledgements.push(acknowledgement);
