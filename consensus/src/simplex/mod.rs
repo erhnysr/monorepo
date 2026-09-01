@@ -28,7 +28,7 @@
 //!
 //! ### Weighted Quorums
 //!
-//! Each epoch's [`Committee`] assigns a positive weight to every participant. Let `W` be the
+//! Each epoch's [`Committee`](commonware_utils::ordered::Committee) assigns a positive weight to every participant. Let `W` be the
 //! total committee weight, `f = floor((W - 1) / 3)` the maximum faulty weight, and `q = W - f`
 //! the quorum weight. A certificate forms when votes from unique participants have combined
 //! weight at least `q`. Uniform unit weights recover the count-based protocol; `q` equals the
