@@ -334,9 +334,9 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
     ///
     /// * `round` - The round being certified.
     /// * `scheme` - Scheme handle used to verify and aggregate votes.
-    /// * `quorum_weight` - Vote weight (2f+1) required to reach a quorum.
-    pub fn new(round: Rnd, scheme: impl Into<Arc<S>>, quorum_weight: u64) -> Self {
+    pub fn new(round: Rnd, scheme: impl Into<Arc<S>>) -> Self {
         let scheme = scheme.into();
+        let quorum_weight = scheme.participants().quorum_weight::<N3f1>();
         let reservation_capacity = usize::try_from(scheme.participants().quorum_count::<N3f1>())
             .expect("participant quorum must fit in usize");
         let batchable = S::is_batchable();
@@ -894,8 +894,7 @@ mod tests {
         let Fixture { schemes, .. } = ed25519::fixture(&mut rng, NAMESPACE, 5);
         let quorum = count_quorum(schemes.len());
         let round = Round::new(Epoch::new(0), View::new(1));
-        let mut verifier =
-            Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone(), quorum);
+        let mut verifier = Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone());
 
         assert_eq!(verifier.notarize.capacities(), (0, 0));
         assert_eq!(verifier.nullify.capacities(), (0, 0));
@@ -973,9 +972,7 @@ mod tests {
     async fn test_count_quorum_is_insufficient_without_quorum_weight() {
         let schemes = weighted_ed25519(&[4, 1, 1, 1]);
         let round = Round::new(Epoch::new(0), View::new(1));
-        let quorum_weight = schemes[0].participants().quorum_weight::<N3f1>();
-        let mut verifier =
-            Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone(), quorum_weight);
+        let mut verifier = Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone());
 
         for scheme in schemes.iter().skip(1) {
             verifier.add(Vote::Nullify(create_nullify(scheme, round)), true);
@@ -997,8 +994,7 @@ mod tests {
         let round = Round::new(Epoch::new(0), View::new(1));
         let quorum_weight = schemes[0].participants().quorum_weight::<N3f1>();
         assert_eq!(quorum_weight, 5);
-        let mut verifier =
-            Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone(), quorum_weight);
+        let mut verifier = Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone());
 
         for scheme in schemes.iter().take(2) {
             verifier.add(Vote::Nullify(create_nullify(scheme, round)), false);
@@ -1022,9 +1018,7 @@ mod tests {
     async fn test_invalid_heavy_signature_does_not_complete_with_valid_lights() {
         let schemes = weighted_ed25519(&[4, 1, 1, 1]);
         let round = Round::new(Epoch::new(0), View::new(1));
-        let quorum_weight = schemes[0].participants().quorum_weight::<N3f1>();
-        let mut verifier =
-            Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone(), quorum_weight);
+        let mut verifier = Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone());
 
         let mut invalid_heavy = create_nullify(&schemes[1], round);
         invalid_heavy.attestation.signer = Participant::new(0);
@@ -1054,8 +1048,7 @@ mod tests {
         let schemes = weighted_ed25519(&[1_000_000, 1, 1, 1]);
         let round = Round::new(Epoch::new(0), View::new(1));
         let quorum_weight = schemes[0].participants().quorum_weight::<N3f1>();
-        let mut verifier =
-            Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone(), quorum_weight);
+        let mut verifier = Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone());
 
         verifier.add(Vote::Nullify(create_nullify(&schemes[0], round)), false);
         let (pending, verified) = verifier.nullify.capacities();
@@ -1104,12 +1097,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
 
         let round = Round::new(Epoch::new(0), View::new(1));
         let leader_notarize = create_notarize(&schemes[0], round, View::new(0), 1);
@@ -1136,11 +1125,8 @@ mod tests {
         verifier.add(Vote::Notarize(notarize_diff), false);
         assert_eq!(verifier.notarize.pending().len(), 2);
 
-        let mut verifier2 = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier2 =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round2 = Round::new(Epoch::new(0), View::new(2));
         let notarize_non_leader = create_notarize(&schemes[1], round2, View::new(1), 3);
         let notarize_leader = create_notarize(&schemes[0], round2, View::new(1), 3);
@@ -1175,12 +1161,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
 
         let round = Round::new(Epoch::new(0), View::new(1));
         let leader_notarize = create_notarize(&schemes[0], round, View::new(0), 1);
@@ -1199,11 +1181,8 @@ mod tests {
         assert_eq!(verifier.proposal(), Some(&leader_notarize.proposal));
         assert_eq!(verifier.notarize.pending().len(), 2);
 
-        let mut verifier2 = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier2 =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         verifier2.add(Vote::Notarize(leader_notarize.clone()), true);
         verifier2.set_leader(leader, Some(&leader_notarize));
         assert_eq!(verifier2.leader(), Some(leader));
@@ -1238,11 +1217,8 @@ mod tests {
 
         // If the notarization arrives first, setting the leader cannot replace
         // its proposal with a conflicting buffered leader vote.
-        let mut verifier3 = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier3 =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         assert!(
             verifier3
                 .set_proposal(ProposalState::Certificate(notarized_proposal.clone()))
@@ -1275,11 +1251,8 @@ mod tests {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
         let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
         let notarizes: Vec<_> = schemes
             .iter()
@@ -1312,11 +1285,8 @@ mod tests {
         assert!(verifier.notarize.pending().is_empty());
         assert!(!verifier.notarize.should_verify());
 
-        let mut verifier2 = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier2 =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round2 = Round::new(Epoch::new(0), View::new(2));
         let leader_vote = create_notarize(&schemes[0], round2, View::new(1), 10);
         let mut faulty_vote = create_notarize(&schemes[1], round2, View::new(1), 10);
@@ -1369,12 +1339,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
         let pending_nullify = create_nullify(&schemes[0], round);
         let verified_nullify = create_nullify(&schemes[1], round);
@@ -1407,12 +1373,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
         let nullifies: Vec<_> = schemes
             .iter()
@@ -1461,12 +1423,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
         let finalize_a = create_finalize(&schemes[0], round, View::new(0), 1);
         let finalize_b = create_finalize(&schemes[1], round, View::new(0), 2);
@@ -1516,12 +1474,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
         let finalizes: Vec<_> = schemes
             .iter()
@@ -1575,12 +1529,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
         let proposal_a = Proposal::new(round, View::new(0), sample_digest(10));
         let proposal_b = Proposal::new(round, View::new(0), sample_digest(20));
@@ -1641,7 +1591,6 @@ mod tests {
         let mut verifier = Verifier::<ed25519::Scheme, Sha256>::new(
             Round::new(Epoch::new(0), View::new(1)),
             schemes[0].clone(),
-            3,
         );
         let leader = Participant::new(0);
         verifier.set_leader(leader, None);
@@ -1658,7 +1607,6 @@ mod tests {
         let mut verifier = Verifier::<ed25519::Scheme, Sha256>::new(
             Round::new(Epoch::new(0), View::new(1)),
             schemes[0].clone(),
-            3,
         );
         verifier.set_leader(Participant::new(0), None);
         verifier.set_leader(Participant::new(1), None);
@@ -1674,7 +1622,6 @@ mod tests {
         let mut verifier = Verifier::<ed25519::Scheme, Sha256>::new(
             Round::new(Epoch::new(0), View::new(1)),
             schemes[0].clone(),
-            3,
         );
         let notarize = create_notarize(
             &schemes[1],
@@ -1693,11 +1640,8 @@ mod tests {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
         let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
         let leader_vote = create_notarize(&schemes[0], round, View::new(0), 1);
 
@@ -1749,11 +1693,8 @@ mod tests {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 3);
         let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
 
         let notarizes: Vec<_> = schemes
@@ -1811,7 +1752,6 @@ mod tests {
             let mut verifier = Verifier::<S, Sha256>::new(
                 Round::new(Epoch::new(0), View::new(1)),
                 schemes[0].clone(),
-                quorum,
             );
             let round = Round::new(Epoch::new(0), View::new(1));
             let finalizes: Vec<_> = schemes
@@ -1880,11 +1820,8 @@ mod tests {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
         let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(3)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(3)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(3));
         let conflicting = Proposal::new(round, View::new(2), sample_digest(8));
         let proposal = Proposal::new(round, View::new(2), sample_digest(9));
@@ -1950,7 +1887,6 @@ mod tests {
         let mut verifier = Verifier::<_, Sha256>::new(
             Round::new(Epoch::new(333), View::new(7)),
             schemes[0].clone(),
-            quorum.try_into().unwrap(),
         );
         let round = Round::new(Epoch::new(333), View::new(7));
         let proposal_a = Proposal::new(round, View::new(6), sample_digest(1));
@@ -2011,12 +1947,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 3);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
         let leader_notarize = create_notarize(&schemes[0], round, View::new(0), 1);
         verifier.set_leader(leader_notarize.signer(), Some(&leader_notarize));
@@ -2043,12 +1975,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 3);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         assert!(verifier.nullify.pending().is_empty());
         assert!(!verifier.nullify.should_verify());
         assert!(
@@ -2079,12 +2007,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 3);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         verifier.set_leader(Participant::new(0), None);
         assert!(verifier.finalize.pending().is_empty());
         assert!(!verifier.finalize.should_verify());
@@ -2117,11 +2041,8 @@ mod tests {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
         let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
 
         let leader_vote = create_notarize(&schemes[0], round, View::new(0), 1);
@@ -2179,11 +2100,8 @@ mod tests {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
         let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
 
         verifier.add(Vote::Nullify(create_nullify(&schemes[0], round)), true);
@@ -2225,11 +2143,8 @@ mod tests {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
         let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
         let leader_finalize = create_finalize(&schemes[0], round, View::new(0), 1);
         let leader_notarize = create_notarize(&schemes[0], round, View::new(0), 1);
@@ -2280,11 +2195,8 @@ mod tests {
             schemes.len() > quorum as usize,
             "test requires more validators than the quorum"
         );
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
 
         // Pre-load the leader vote as if it had already been processed.
@@ -2342,11 +2254,8 @@ mod tests {
             schemes.len() > quorum as usize,
             "test requires more validators than the quorum"
         );
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
 
         // First mark a quorum's worth of verified nullifies.
@@ -2396,11 +2305,8 @@ mod tests {
             schemes.len() > quorum as usize,
             "test requires more validators than the quorum"
         );
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
 
         // Prime the leader state so the quorum is already satisfied by verified finalizes.
@@ -2516,12 +2422,8 @@ mod tests {
     {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = fixture(&mut rng, NAMESPACE, 5);
-        let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<S, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<S, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
 
         verifier.record_certificate(Kind::Notarization);
@@ -2557,7 +2459,7 @@ mod tests {
         let quorum = count_quorum(schemes.len());
         let quorum_size = usize::try_from(quorum).expect("quorum exceeds usize::MAX");
         let round = Round::new(Epoch::new(0), View::new(1));
-        let mut verifier = Verifier::<_, Sha256>::new(round, schemes[0].clone(), quorum);
+        let mut verifier = Verifier::<_, Sha256>::new(round, schemes[0].clone());
 
         let leader_notarize = create_notarize(&schemes[0], round, View::new(0), 1);
         verifier.set_leader(leader_notarize.signer(), Some(&leader_notarize));
@@ -2576,11 +2478,8 @@ mod tests {
         let mut rng = test_rng();
         let Fixture { schemes, .. } = ed25519::fixture(&mut rng, NAMESPACE, 5);
         let quorum = count_quorum(schemes.len());
-        let mut verifier = Verifier::<_, Sha256>::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            schemes[0].clone(),
-            quorum,
-        );
+        let mut verifier =
+            Verifier::<_, Sha256>::new(Round::new(Epoch::new(0), View::new(1)), schemes[0].clone());
         let round = Round::new(Epoch::new(0), View::new(1));
 
         // Give every kind a pre-verified quorum
