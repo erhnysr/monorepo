@@ -9,15 +9,15 @@ use commonware_runtime::{
 };
 use commonware_utils::{Array, ordered::Profile};
 
-/// An immutable gauge that preserves the full `u64` range.
+/// An immutable gauge that encodes `u64` values without narrowing to `i64`.
 #[derive(Debug)]
-struct ImmutableGauge(u64);
+struct U64Gauge(u64);
 
-impl TypedMetric for ImmutableGauge {
+impl TypedMetric for U64Gauge {
     const TYPE: MetricType = MetricType::Gauge;
 }
 
-impl EncodeMetric for ImmutableGauge {
+impl EncodeMetric for U64Gauge {
     fn encode(&self, mut encoder: MetricEncoder<'_>) -> Result<(), std::fmt::Error> {
         encoder.encode_gauge(&self.0)
     }
@@ -28,15 +28,15 @@ impl EncodeMetric for ImmutableGauge {
 }
 
 /// Committee profile metrics retained by the engine.
-pub(crate) struct Committee {
-    _total_weight: Registered<ImmutableGauge>,
-    _max_fault_weight: Registered<ImmutableGauge>,
-    _quorum_weight: Registered<ImmutableGauge>,
-    _max_participant_weight: Registered<ImmutableGauge>,
-    _minimum_quorum_cardinality: Registered<ImmutableGauge>,
+pub(crate) struct CommitteeProfile {
+    _total_weight: Registered<U64Gauge>,
+    _max_fault_weight: Registered<U64Gauge>,
+    _quorum_weight: Registered<U64Gauge>,
+    _max_participant_weight: Registered<U64Gauge>,
+    _minimum_quorum_cardinality: Registered<U64Gauge>,
 }
 
-impl Committee {
+impl CommitteeProfile {
     /// Registers metrics for an epoch's committee profile.
     pub(crate) fn init(context: &impl RuntimeMetrics, epoch: Epoch, profile: Profile) -> Self {
         let context = context.child("committee").with_attribute("epoch", epoch);
@@ -44,27 +44,27 @@ impl Committee {
             _total_weight: context.register(
                 "total_weight",
                 "Total weight of the committee",
-                ImmutableGauge(profile.total_weight),
+                U64Gauge(profile.total_weight),
             ),
             _max_fault_weight: context.register(
                 "max_fault_weight",
                 "Maximum faulty weight tolerated by the committee",
-                ImmutableGauge(profile.max_fault_weight),
+                U64Gauge(profile.max_fault_weight),
             ),
             _quorum_weight: context.register(
                 "quorum_weight",
                 "Weight required for a committee quorum",
-                ImmutableGauge(profile.quorum_weight),
+                U64Gauge(profile.quorum_weight),
             ),
             _max_participant_weight: context.register(
                 "max_participant_weight",
                 "Maximum weight of one committee participant",
-                ImmutableGauge(profile.max_weight),
+                U64Gauge(profile.max_weight),
             ),
             _minimum_quorum_cardinality: context.register(
                 "minimum_quorum_cardinality",
                 "Minimum number of participants required to reach committee quorum",
-                ImmutableGauge(profile.minimum_quorum_cardinality.into()),
+                U64Gauge(profile.minimum_quorum_cardinality.into()),
             ),
         }
     }
@@ -252,7 +252,7 @@ mod tests {
                 max_weight: total_weight - 4,
                 minimum_quorum_cardinality: 2,
             };
-            let _metrics = Committee::init(&context, Epoch::new(7), profile);
+            let _metrics = CommitteeProfile::init(&context, Epoch::new(7), profile);
             let encoded = context.encode();
 
             for (name, value) in [
@@ -282,8 +282,8 @@ mod tests {
                 max_weight: total_weight - 2,
                 minimum_quorum_cardinality: 2,
             };
-            let _first = Committee::init(&context, Epoch::new(1), profile(10));
-            let _second = Committee::init(&context, Epoch::new(2), profile(20));
+            let _first = CommitteeProfile::init(&context, Epoch::new(1), profile(10));
+            let _second = CommitteeProfile::init(&context, Epoch::new(2), profile(20));
             let encoded = context.encode();
 
             assert!(encoded.contains("committee_total_weight{epoch=\"1\"} 10"));

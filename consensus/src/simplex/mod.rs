@@ -28,11 +28,11 @@
 //!
 //! ### Weighted Quorums
 //!
-//! Each epoch's [`Committee`](commonware_utils::ordered::Committee) assigns a positive weight to every participant. Let `W` be the
-//! total committee weight, `f = floor((W - 1) / 3)` the maximum faulty weight, and `q = W - f`
-//! the quorum weight. A certificate forms when votes from unique participants have combined
-//! weight at least `q`. Uniform unit weights recover the count-based protocol; `q` equals the
-//! familiar `2f+1` when `W = 3f+1`.
+//! Each epoch's [`Committee`](commonware_utils::ordered::Committee) assigns a positive weight to
+//! every participant. Let `W` be the total committee weight, `f = floor((W - 1) / 3)` the maximum
+//! faulty weight, and `q = W - f` the quorum weight. A certificate forms when votes from unique
+//! participants have combined weight at least `q`. Uniform unit weights recover the count-based
+//! protocol. When `W = 3f+1`, `q` equals the familiar `2f+1`.
 //!
 //! ### Specification for View `v`
 //!
@@ -87,9 +87,9 @@
 //!
 //! ### Joining Consensus
 //!
-//! As soon as quorum weight `q` in nullifies or finalizes is observed for some view `v`, the `Voter` will
-//! enter the corresponding successor view (`next_term_start(v)` for nullification, `v+1` for
-//! finalization). Notarizations advance the view if-and-only-if the application certifies them.
+//! As soon as the `Voter` observes quorum weight `q` in nullifies or finalizes for view `v`, it
+//! enters the corresponding successor view (`next_term_start(v)` for nullification, `v+1` for
+//! finalization). Notarizations advance the view only if the application certifies them.
 //! This means that a new participant joining consensus will immediately jump ahead on the previous
 //! view's nullification or finalization and begin participating in consensus at the current view.
 //!
@@ -126,8 +126,8 @@
 //!   either a "block" or a "dummy block", respectively.
 //! * Introduce a "leader timeout" to trigger early view transitions for unresponsive leaders.
 //! * Skip "leader timeout" and "certification timeout" if a designated leader has not participated
-//!   for the configured skip timeout while participants with quorum weight have (again to trigger
-//!   early view transition for an unresponsive leader).
+//!   for the configured skip timeout while activity has reached quorum weight. This triggers an
+//!   early view transition for an unresponsive leader.
 //! * Introduce message rebroadcast to continue making progress if messages from a given view are dropped (only way
 //!   to ensure messages are reliably delivered is with a heavyweight reliable broadcast protocol).
 //! * Treat local proposal failure as immediate timeout expiry and broadcast `nullify(v)`.
@@ -177,10 +177,10 @@
 //! `f` honest weight broadcast `nullify` at a single view `u` in `[term_start(v), v]`. If every
 //! view in that term prefix completes without any nullify trigger (just view `v` itself when
 //! `term_length` is 1), no honest participant has broadcast a covering `nullify`: at most `f`
-//! faulty weight can provide covering votes at any single view, which is insufficient to form a nullification
-//! certificate. Without that certificate, no future leader can skip view `v`, and the notarized
-//! payload must be included as an ancestor in all subsequent proposals. Note that a clean view
-//! `v` alone is not enough when `term_length > 1`: an honest `nullify` broadcast at an earlier
+//! faulty weight can provide covering votes at any single view. This is insufficient to form a
+//! nullification certificate. Without that certificate, no future leader can skip view `v`, and
+//! the notarized payload must be included as an ancestor in all subsequent proposals. A clean
+//! view `v` alone is not enough when `term_length > 1`: an honest `nullify` broadcast at an earlier
 //! view of the term (say, after a transient timeout at a view that later notarized) covers `v`
 //! even though no trigger fired at `v` itself.
 //!
@@ -263,9 +263,9 @@
 //! still be inside a view of the term prefix, where a trigger can still fire (say, a
 //! certification that outlives `t_a`). Exclusion requires participants representing more than `f`
 //! honest weight to broadcast `nullify` at a single view of that prefix. Because certification is
-//! deterministic, it either fails for all honest participants or none, so a certification failure always
-//! produces a nullification. In the common case (no faults, no timeouts), exclusion cannot
-//! happen.
+//! deterministic, it either fails for all honest participants or none. A certification failure
+//! therefore always produces a nullification. In the common case (no faults, no timeouts),
+//! exclusion cannot happen.
 //!
 //! A Byzantine leader, however, can exclude even its own valid, certifiable, and timely proposal:
 //! honest participants treat the leader's `nullify(v)` as an immediate timeout, so a leader can
@@ -708,7 +708,7 @@ mod tests {
         buffer::paged::CacheRef, deterministic, telemetry::metrics::count_running_tasks,
     };
     use commonware_utils::{
-        Faults, N3f1, NZU16, NZU32, NZUsize, TestRng, non_empty,
+        Faults, N3f1, NZU16, NZU32, NZUsize, TestRng, TryCollect, non_empty,
         ordered::{Committee, Set},
         probability,
         sync::Mutex,
@@ -795,14 +795,12 @@ mod tests {
     const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(10);
 
     fn unit_committee<P: Ord + Clone>(participants: &[P]) -> Committee<P> {
-        Committee::try_from(
-            participants
-                .iter()
-                .cloned()
-                .map(|participant| (participant, 1))
-                .collect::<Vec<_>>(),
-        )
-        .unwrap()
+        participants
+            .iter()
+            .cloned()
+            .map(|participant| (participant, 1))
+            .try_collect()
+            .unwrap()
     }
 
     fn weighted_ed25519_fixture<R: CryptoRng>(
@@ -819,14 +817,12 @@ mod tests {
             namespace,
             u32::try_from(weights.len()).expect("test committee must fit in u32"),
         );
-        let committee = Committee::try_from(
-            participants
-                .iter()
-                .cloned()
-                .zip(weights.iter().copied())
-                .collect::<Vec<_>>(),
-        )
-        .expect("test committee must be valid");
+        let committee: Committee<_> = participants
+            .iter()
+            .cloned()
+            .zip(weights.iter().copied())
+            .try_collect()
+            .expect("test committee must be valid");
         let schemes = private_keys
             .iter()
             .cloned()

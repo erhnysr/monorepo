@@ -8,7 +8,10 @@ use crate::{
     },
     types::{Participant, Round as Rnd},
 };
-use commonware_cryptography::{Digest, certificate::Verification};
+use commonware_cryptography::{
+    Digest,
+    certificate::{Attestation, Verification},
+};
 use commonware_parallel::Strategy;
 use commonware_runtime::telemetry::traces::TracedExt as _;
 use commonware_utils::{
@@ -32,6 +35,23 @@ where
     strategy
         .spawn(len, move |strategy| worker_span.in_scope(|| job(strategy)))
         .instrument(span)
+}
+
+fn participant_weight<P: Ord>(committee: &Committee<P>, participant: Participant) -> u64 {
+    committee.weight(participant).unwrap_or(0)
+}
+
+fn attestation_weight<'a, S, D>(
+    scheme: &S,
+    attestations: impl Iterator<Item = &'a Attestation<S>>,
+) -> u64
+where
+    S: Scheme<D> + 'a,
+    D: Digest,
+{
+    attestations
+        .map(|attestation| participant_weight(scheme.participants(), attestation.signer))
+        .sum()
 }
 
 /// Certification progress for one kind of vote.
@@ -148,10 +168,10 @@ impl<V> Certification<V> {
     /// returns, or `None` if a batch is not worth verifying (see
     /// [Self::should_verify]).
     ///
-    /// `f` receives the pending and previously verified votes and returns the
-    /// combined verified set, the weight added by this batch, and the signers
-    /// that failed verification. Returns the number of votes processed
-    /// alongside those signers.
+    /// `f` receives pending votes and prior verified votes. It returns their
+    /// combined verified set, the weight contributed by newly verified pending
+    /// votes, and invalid signers. This method returns the pending batch length
+    /// with those invalid signers.
     async fn try_verify<F, Fut>(&mut self, f: F) -> Option<(usize, Vec<Participant>)>
     where
         F: FnOnce(Vec<V>, Vec<V>) -> Fut,
@@ -292,8 +312,7 @@ impl<D: Digest> ProposalState<D> {
 /// efficient batch verification. For schemes where `is_batchable()` returns `false` (such as [secp256r1]),
 /// signatures are verified eagerly as they arrive since there is no batching benefit.
 ///
-/// To avoid unnecessary verification, it also tracks the weight of already verified messages (ensuring
-/// we no longer attempt to verify messages after a quorum of valid weight has already been verified).
+/// The verifier tracks verified weight and stops verification after reaching quorum.
 ///
 /// Once polled, async verification moves the pending batch and accumulated verified votes into
 /// the worker. Do not cancel an in-flight verification unless the verifier will also be discarded.
@@ -487,11 +506,11 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
         let participants = self.scheme.participants();
         self.notarize.retain(
             |n| &n.proposal == proposal,
-            |n| participants.weight(n.signer()).unwrap_or(0),
+            |n| participant_weight(participants, n.signer()),
         );
         self.finalize.retain(
             |f| &f.proposal == proposal,
-            |f| participants.weight(f.signer()).unwrap_or(0),
+            |f| participant_weight(participants, f.signer()),
         );
         ProposalUpdate {
             changed: true,
@@ -519,11 +538,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
     pub fn add(&mut self, msg: Vote<S, D>, verified: bool) {
         match msg {
             Vote::Notarize(notarize) => {
-                let weight = self
-                    .scheme
-                    .participants()
-                    .weight(notarize.signer())
-                    .unwrap_or(0);
+                let weight = participant_weight(self.scheme.participants(), notarize.signer());
                 self.try_set_proposal_from_leader(&notarize);
 
                 // If the proposal is known and the message is not for it, drop it
@@ -535,19 +550,11 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                 self.notarize.add(notarize, weight, verified);
             }
             Vote::Nullify(nullify) => {
-                let weight = self
-                    .scheme
-                    .participants()
-                    .weight(nullify.signer())
-                    .unwrap_or(0);
+                let weight = participant_weight(self.scheme.participants(), nullify.signer());
                 self.nullify.add(nullify, weight, verified);
             }
             Vote::Finalize(finalize) => {
-                let weight = self
-                    .scheme
-                    .participants()
-                    .weight(finalize.signer())
-                    .unwrap_or(0);
+                let weight = participant_weight(self.scheme.participants(), finalize.signer());
                 // If the proposal is known and the message is not for it, drop it
                 if let Some(proposal) = self.proposal()
                     && proposal != &finalize.proposal
@@ -635,15 +642,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                         &strategy,
                     );
 
-                    let added_weight = verified
-                        .iter()
-                        .map(|attestation| {
-                            scheme
-                                .participants()
-                                .weight(attestation.signer)
-                                .unwrap_or(0)
-                        })
-                        .sum();
+                    let added_weight = attestation_weight(scheme.as_ref(), verified.iter());
                     verified_notarizes.extend(verified.into_iter().zip(proposals).map(
                         |(attestation, proposal)| Notarize {
                             proposal,
@@ -694,15 +693,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                         &strategy,
                     );
 
-                    let added_weight = verified
-                        .iter()
-                        .map(|attestation| {
-                            scheme
-                                .participants()
-                                .weight(attestation.signer)
-                                .unwrap_or(0)
-                        })
-                        .sum();
+                    let added_weight = attestation_weight(scheme.as_ref(), verified.iter());
                     verified_nullifies.extend(
                         verified
                             .into_iter()
@@ -765,15 +756,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                         &strategy,
                     );
 
-                    let added_weight = verified
-                        .iter()
-                        .map(|attestation| {
-                            scheme
-                                .participants()
-                                .weight(attestation.signer)
-                                .unwrap_or(0)
-                        })
-                        .sum();
+                    let added_weight = attestation_weight(scheme.as_ref(), verified.iter());
                     verified_finalizes.extend(verified.into_iter().zip(proposals).map(
                         |(attestation, proposal)| Finalize {
                             proposal,

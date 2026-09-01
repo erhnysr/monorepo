@@ -50,7 +50,8 @@ struct Current {
 fn required_active_weight<P: Ord>(participants: &Committee<P>, me: Option<Participant>) -> u64 {
     let quorum_weight = participants.quorum_weight::<N3f1>();
     me.map_or(quorum_weight, |me| {
-        // We are live by construction (we never observe our own messages).
+        // Local participants are live by construction because they do not receive their own
+        // messages.
         quorum_weight.saturating_sub(
             participants
                 .weight(me)
@@ -221,8 +222,8 @@ where
         }
     }
 
-    /// Returns true if the participant has sent a recent message, or if less
-    /// than the required weight has recently been active (fail-open).
+    /// Returns true if the participant has sent a recent message or recent
+    /// activity is below the required weight.
     fn is_active(&self, participant: Participant, skip_timeout: Duration) -> bool {
         // Track activity with wall-clock time rather than raw view deltas. Stable-leader terms can
         // skip many view numbers at once, so we only fast-timeout when a quorum has been active
@@ -235,8 +236,8 @@ where
         let recent =
             |activity: &Option<SystemTime>| activity.is_some_and(|activity| activity >= min_time);
 
-        // If less than the required weight is recently active, we "fail-open"
-        // since we know the network is not expected to be responsive.
+        // Treat the participant as active when the network is not expected to be
+        // responsive.
         let active = recent_activity_weight(
             &self.last_activity,
             self.scheme.participants().weights(),

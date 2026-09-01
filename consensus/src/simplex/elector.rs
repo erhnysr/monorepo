@@ -52,9 +52,7 @@ pub trait Config<S: Scheme>: Clone + Send + 'static {
     /// The initialized elector type.
     type Elector: Elector<S>;
 
-    /// Builds the elector with the given participants.
-    ///
-    /// Called internally by consensus with the correct committee.
+    /// Builds the elector for the epoch committee.
     fn build(self, participants: &Committee<S::PublicKey>) -> Self::Elector;
 }
 

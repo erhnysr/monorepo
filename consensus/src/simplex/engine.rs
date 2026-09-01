@@ -33,7 +33,7 @@ pub struct Engine<
     T: Strategy,
 > {
     context: ContextCell<E>,
-    _committee_metrics: metrics::Committee,
+    _committee_metrics: metrics::CommitteeProfile,
 
     voter: voter::Actor<E, S, L::Elector, B, D, A, R, F>,
     voter_mailbox: voter::Mailbox<S, D>,
@@ -160,7 +160,7 @@ impl<
                 "participant weight reaches quorum",
             );
         }
-        let committee_metrics = metrics::Committee::init(&context, cfg.epoch, profile);
+        let committee_metrics = metrics::CommitteeProfile::init(&context, cfg.epoch, profile);
 
         // Return the engine
         Self {
