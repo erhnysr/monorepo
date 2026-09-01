@@ -1162,11 +1162,64 @@ mod tests {
                 panic!("missing latest report");
             };
             assert_eq!(epoch, Epoch::new(3));
+
+            drop(receiver);
+            let mut handler =
+                Handler::<crate::dkg::tests::mocks::MockBlock<TestDigest, u64>, Exact> {
+                    sender,
+                    epocher: FixedEpocher::new(NZU64!(2)),
+                    _block: PhantomData,
+                };
+            let mut cloned = handler.clone();
+            assert_eq!(
+                cloned.report(Update::Tip(
+                    commonware_consensus::types::Round::zero(),
+                    Height::zero(),
+                    Sha256::hash(&[b"tip"]),
+                )),
+                Feedback::Ok
+            );
+            let block = Arc::new(crate::dkg::tests::mocks::MockBlock::new::<Sha256>(
+                0,
+                Sha256::hash(&[b"parent"]),
+                Height::zero(),
+                0,
+            ));
+            let (acknowledgement, acknowledged) = Exact::handle();
+            assert_eq!(
+                handler.report(Update::Block(block, acknowledgement)),
+                Feedback::Closed
+            );
+            assert!(acknowledged.await.is_err());
+        });
+    }
+
+    #[test]
+    fn certificate_reporter_exposes_bounded_admission() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let fixture = scheme::ed25519::fixture(&mut context, b"certificate-reporter", 1);
+            let first_certificate = certificate(&fixture.schemes, Epoch::new(1), Height::new(1));
+            let (sender, mut receiver) =
+                mailbox::new_unreliable(context.child("certificates"), NZUsize!(1));
+            let mut reporter = CertificateReporter { sender };
+
+            assert_eq!(reporter.report(first_certificate.clone()), Feedback::Ok);
+            assert_eq!(
+                reporter.report(first_certificate.clone()),
+                Feedback::Backoff
+            );
+            assert!(matches!(receiver.recv().await, Some(CertificateMessage(_))));
+            assert_eq!(reporter.report(first_certificate), Feedback::Ok);
+            drop(receiver);
+            assert_eq!(
+                reporter.report(certificate(&fixture.schemes, Epoch::new(1), Height::new(2),)),
+                Feedback::Closed
+            );
         });
     }
 
     #[test_traced]
-    fn active_horizon_stops_engines_and_keeps_epoch_schemes_isolated() {
+    fn lifecycle_loop_advances_parks_retires_and_shuts_down() {
         deterministic::Runner::timed(Duration::from_secs(20)).start(|mut context| async move {
             const NAMESPACE: &[u8] = b"aggregation lifecycle transitions";
             let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 7);
@@ -1283,6 +1336,29 @@ mod tests {
                 );
             }
             assert!(history.retire(cleanup_retirement).await.unwrap().is_some());
+            let parked_retirement = Retirement {
+                namespace,
+                epoch: Epoch::new(1),
+                first: epocher.first(Epoch::new(1)).unwrap(),
+                last: epocher.last(Epoch::new(1)).unwrap(),
+            };
+            for position in parked_retirement.first.get()..=parked_retirement.last.get() {
+                let position = Height::new(position);
+                assert_eq!(
+                    history
+                        .archive(
+                            RecoveryKey {
+                                namespace,
+                                epoch: Epoch::new(1),
+                                position,
+                            },
+                            certificate(&cleanup_signers, Epoch::new(1), position).encode(),
+                        )
+                        .await
+                        .unwrap(),
+                    ArchiveStatus::Stored
+                );
+            }
             let cleanup_journal = journal_config(
                 &context,
                 epoch_schemes[0].as_ref(),
@@ -1302,9 +1378,8 @@ mod tests {
             .unwrap();
             assert!(certificates.is_empty());
             drop(journal);
-            let (recovery_coordinator, recovery) =
+            let (_recovery_coordinator, recovery) =
                 RecoveryCoordinator::staged(context.child("recovery"), NZUsize!(16), NZUsize!(32));
-            drop(recovery_coordinator);
             let (router_actor, _, registry) =
                 crate::dkg::orchestrator::aggregation_router::Actor::new(
                     context.child("router"),
@@ -1331,12 +1406,106 @@ mod tests {
                 .register(0, Quota::per_second(NonZeroU32::MAX))
                 .await
                 .unwrap();
+            let (closed_sender, closed_receiver) = oracle
+                .control(fixture.participants[0].clone())
+                .register(1, Quota::per_second(NonZeroU32::MAX))
+                .await
+                .unwrap();
             let (muxer, mux_handle) = Muxer::new(context.child("mux"), sender, receiver, 32);
             let mux_task = muxer.start();
+            let (_closed_mux, closed_mux_handle) = Muxer::new(
+                context.child("closed_mux"),
+                closed_sender,
+                closed_receiver,
+                1,
+            );
+
+            let (closed_history_actor, closed_history) =
+                HistoryActor::<_, TestScheme, TestDigest, _, _>::init(
+                    context.child("closed_history"),
+                    history_config(
+                        &context,
+                        namespace,
+                        epoch_schemes[0].certificate_codec_config(),
+                        "closed",
+                    ),
+                    provider.clone(),
+                    Sequential,
+                )
+                .await
+                .unwrap();
+            drop(closed_history_actor);
+            let (closed_router, _, closed_registry) =
+                crate::dkg::orchestrator::aggregation_router::Actor::new(
+                    context.child("closed_router"),
+                    closed_history.clone(),
+                    provider.clone(),
+                    recovery.clone(),
+                    NZUsize!(1),
+                );
+            let (_closed_fence, closed_gate) = crate::dkg::fence::Fence::new(Epoch::new(7));
+            let (mut closed_lifecycle, _) =
+                Actor::<_, TestScheme, TestDigest, _, _, _, _, _, _, Exact>::new::<
+                    crate::dkg::tests::mocks::MockBlock<TestDigest, u64>,
+                >(
+                    context.child("closed_lifecycle"),
+                    Config {
+                        namespace,
+                        current_epoch: Epoch::new(2),
+                        epocher: epocher.clone(),
+                        active_old_epochs: 1,
+                        mailbox_size: NZUsize!(1),
+                        certificate_mailbox_size: NZUsize!(1),
+                        parked_interval: Duration::from_secs(1),
+                        parked_missing_batch: NZUsize!(1),
+                        automaton: PendingApplication::default(),
+                        blocker: NoopBlocker,
+                        strategy: Sequential,
+                        engine: EngineConfig {
+                            priority_acks: false,
+                            rebroadcast_timeout: NonZeroDuration::new_panic(Duration::from_secs(
+                                10,
+                            )),
+                            recovery_after_rebroadcasts: NZU64!(10),
+                            window: NZU64!(2),
+                            journal_partition_prefix: "closed_lifecycle_engine".into(),
+                            journal_write_buffer: NZUsize!(4096),
+                            journal_replay_buffer: NZUsize!(4096),
+                            journal_heights_per_section: NZU64!(4),
+                            journal_compression: None,
+                            journal_page_cache: CacheRef::from_pooler(
+                                &context,
+                                NZU16!(1024),
+                                NZUsize!(10),
+                            ),
+                        },
+                    },
+                    provider.clone(),
+                    closed_history,
+                    closed_registry,
+                    closed_gate,
+                    recovery.clone(),
+                    closed_mux_handle,
+                );
+            assert!(matches!(
+                closed_lifecycle.discover_startup().await,
+                Err(Error::HistoryClosed)
+            ));
+            let closed_certificate = certificate(
+                &cleanup_signers,
+                Epoch::new(1),
+                epocher.first(Epoch::new(1)).unwrap(),
+            );
+            assert!(matches!(
+                closed_lifecycle.archive(closed_certificate).await,
+                Err(Error::HistoryClosed)
+            ));
+            drop(closed_router);
+
             let (_fence, gate) = crate::dkg::fence::Fence::new(Epoch::new(7));
             let application = PendingApplication::default();
             let requested = application.0.clone();
-            let (mut actor, _handler) =
+            let (mut actor, mut handler) =
                 Actor::<_, TestScheme, TestDigest, _, _, _, _, _, _, Exact>::new::<
                     crate::dkg::tests::mocks::MockBlock<TestDigest, u64>,
                 >(
@@ -1380,16 +1549,64 @@ mod tests {
                     mux_handle,
                 );
 
-            actor.discover_startup().await.unwrap();
-            assert_eq!(
-                actor
-                    .active
-                    .keys()
-                    .map(|epoch| epoch.get())
-                    .collect::<Vec<_>>(),
-                vec![1, 2]
-            );
-            assert!(actor.parked.is_empty());
+            assert!(actor.descriptor(Epoch::new(2)).await.is_ok());
+            let schemes = actor.provider.schemes.clone();
+            actor.provider.schemes = Arc::new(BTreeMap::new());
+            assert!(matches!(
+                actor.descriptor(Epoch::new(2)).await,
+                Err(Error::MissingScheme(epoch)) if epoch == Epoch::new(2)
+            ));
+            let rogue = scheme::ed25519::fixture(&mut context, b"rogue lifecycle", 1)
+                .schemes
+                .into_iter()
+                .next()
+                .unwrap();
+            actor.provider.schemes = Arc::new(BTreeMap::from([(Epoch::new(2), Arc::new(rogue))]));
+            assert!(matches!(
+                actor.descriptor(Epoch::new(2)).await,
+                Err(Error::NamespaceMismatch(epoch)) if epoch == Epoch::new(2)
+            ));
+            actor.provider.schemes = schemes;
+
+            let (closed_fence, closed_gate) = crate::dkg::fence::Fence::new(Epoch::new(1));
+            drop(closed_fence);
+            let gate = std::mem::replace(&mut actor.gate, closed_gate);
+            assert!(matches!(
+                actor.descriptor(Epoch::new(2)).await,
+                Err(Error::GateClosed(epoch)) if epoch == Epoch::new(2)
+            ));
+            actor.gate = gate;
+
+            let descriptor = actor.descriptor(Epoch::new(2)).await.unwrap();
+            actor.parked.insert(Epoch::new(2), descriptor);
+            actor.parked_running.insert(Epoch::new(2));
+            actor
+                .parked_completed(
+                    Epoch::new(2),
+                    Ok(ParkedOutcome::Parked {
+                        journal_archived: true,
+                    }),
+                )
+                .unwrap();
+            assert!(actor.parked[&Epoch::new(2)].journal_archived);
+            assert!(!actor.parked_running.contains(&Epoch::new(2)));
+            actor
+                .parked_completed(Epoch::new(2), Ok(ParkedOutcome::Retired))
+                .unwrap();
+            assert!(!actor.parked.contains_key(&Epoch::new(2)));
+            actor
+                .parked_completed(Epoch::new(2), Ok(ParkedOutcome::Retired))
+                .unwrap();
+            actor
+                .completed(Epoch::new(2), EngineOutcome::Completed)
+                .await
+                .unwrap();
+
+            let lifecycle_task = actor.start();
+            let initial = epocher.first(Epoch::new(2)).unwrap();
+            while !requested.lock().contains_key(&initial) {
+                context.sleep(Duration::from_millis(1)).await;
+            }
             assert!(
                 history
                     .pending_cleanups(namespace, NZUsize!(8))
@@ -1397,76 +1614,50 @@ mod tests {
                     .unwrap()
                     .is_empty()
             );
-            let mut replacement = cleanup_journal;
-            replacement.identity.epoch = Epoch::new(99);
-            let (replacement, certificates) = Journal::<_, TestScheme, TestDigest>::init(
-                context.child("cleanup_replacement"),
-                replacement,
-                &mut context,
-                epoch_schemes[0].as_ref(),
-                &Sequential,
-            )
-            .await
-            .unwrap();
-            assert!(certificates.is_empty());
-            replacement.destroy().await.unwrap();
-            for (epoch, active) in &actor.active {
-                assert!(Arc::ptr_eq(
-                    &active.descriptor.scheme,
-                    provider.schemes.get(epoch).unwrap()
-                ));
-            }
-
-            actor.advance(Epoch::new(5)).await.unwrap();
-            assert_eq!(
-                actor
-                    .active
-                    .keys()
-                    .map(|epoch| epoch.get())
-                    .collect::<Vec<_>>(),
-                vec![4, 5]
-            );
-            assert!(actor.active.len() <= actor.config.active_old_epochs + 1);
+            let report = |epoch: Epoch| {
+                Arc::new(crate::dkg::tests::mocks::MockBlock::new::<Sha256>(
+                    epoch.get(),
+                    Sha256::hash(&[b"parent"]),
+                    epocher.first(epoch).unwrap(),
+                    epoch.get(),
+                ))
+            };
+            let (acknowledgement, acknowledged) = Exact::handle();
             assert!(
-                [1, 2, 3]
-                    .into_iter()
-                    .all(|epoch| actor.parked.contains_key(&Epoch::new(epoch)))
+                handler
+                    .report(Update::Block(report(Epoch::new(5)), acknowledgement))
+                    .accepted()
             );
-            for (epoch, active) in &actor.active {
-                assert!(Arc::ptr_eq(
-                    &active.descriptor.scheme,
-                    provider.schemes.get(epoch).unwrap()
-                ));
+            acknowledged.await.unwrap();
+            let advanced = epocher.first(Epoch::new(5)).unwrap();
+            while !requested.lock().contains_key(&advanced) {
+                context.sleep(Duration::from_millis(1)).await;
             }
-
-            actor.advance(Epoch::new(7)).await.unwrap();
-            assert_eq!(
-                actor
-                    .active
-                    .keys()
-                    .map(|epoch| epoch.get())
-                    .collect::<Vec<_>>(),
-                vec![6, 7]
-            );
-            assert!(actor.active.len() <= actor.config.active_old_epochs + 1);
+            while !history.retired(parked_retirement).await.unwrap() {
+                context.sleep(Duration::from_millis(1)).await;
+            }
             assert!(
-                [1, 2, 3, 4, 5]
-                    .into_iter()
-                    .all(|epoch| actor.parked.contains_key(&Epoch::new(epoch)))
+                history
+                    .pending_cleanups(namespace, NZUsize!(8))
+                    .await
+                    .unwrap()
+                    .is_empty()
             );
-            for (epoch, active) in &actor.active {
-                assert!(Arc::ptr_eq(
-                    &active.descriptor.scheme,
-                    provider.schemes.get(epoch).unwrap()
-                ));
-            }
+
+            let (acknowledgement, acknowledged) = Exact::handle();
+            assert!(
+                handler
+                    .report(Update::Block(report(Epoch::new(7)), acknowledgement))
+                    .accepted()
+            );
+            acknowledged.await.unwrap();
             let latest = epocher.first(Epoch::new(7)).unwrap();
             while !requested.lock().contains_key(&latest) {
                 context.sleep(Duration::from_millis(1)).await;
             }
 
-            actor.shutdown().await.unwrap();
-            assert!(actor.active.is_empty());
+            drop(handler);
+            lifecycle_task.await.unwrap().unwrap();
             context.child("stop").stop(0, None).await.unwrap();
             history_task.await.unwrap().unwrap();
             router_task.await.unwrap();

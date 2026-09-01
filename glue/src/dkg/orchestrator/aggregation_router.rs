@@ -256,7 +256,14 @@ where
                 return;
             }
             Ok(Outcome::Complete) => {}
-            Ok(Outcome::Ambiguous | Outcome::Ignored) | Err(_) => return,
+            Ok(outcome @ (Outcome::Ambiguous | Outcome::Ignored)) => {
+                response.send(outcome);
+                return;
+            }
+            Err(_) => {
+                response.send(Outcome::Ambiguous);
+                return;
+            }
         }
 
         let Some(mut mailbox) = self.routes.get(&(key.namespace, key.epoch)).cloned() else {
@@ -310,23 +317,31 @@ mod tests {
     };
     use commonware_actor::Feedback;
     use commonware_codec::{Encode as _, Read};
-    use commonware_consensus::aggregation::{
-        scheme,
-        types::{Ack, Item},
+    use commonware_consensus::{
+        Automaton, Reporter,
+        aggregation::{
+            Config as EngineConfig, Engine, scheme,
+            types::{Ack, Item},
+        },
+        types::Height,
     };
     use commonware_cryptography::{
         Hasher as _, Sha256,
         certificate::{Scoped, Verifier as _},
+        ed25519::PublicKey,
     };
     use commonware_macros::test_traced;
+    use commonware_p2p::Blocker;
     use commonware_parallel::Sequential;
     use commonware_resolver::p2p::Producer as _;
     use commonware_runtime::{
-        Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
+        Clock as _, Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
     };
     use commonware_storage::{archive::immutable, metadata};
-    use commonware_utils::{NZU16, NZU64, NZUsize, non_empty, non_empty_vec, sync::Mutex};
-    use std::{collections::BTreeMap, sync::Arc};
+    use commonware_utils::{
+        NZU16, NZU64, NZUsize, NonZeroDuration, non_empty, non_empty_vec, sync::Mutex,
+    };
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     type TestScheme = scheme::ed25519::Scheme;
     type TestDigest = commonware_cryptography::sha256::Digest;
@@ -335,7 +350,7 @@ mod tests {
     struct TestProvider {
         namespace: RecoveryNamespace,
         epochs: Arc<BTreeMap<Epoch, AuthenticatedEpoch<TestScheme>>>,
-        scheme: Arc<TestScheme>,
+        schemes: Arc<BTreeMap<Epoch, Arc<TestScheme>>>,
     }
 
     impl HistoryProvider<TestScheme> for TestProvider {
@@ -359,9 +374,52 @@ mod tests {
         type Scheme = TestScheme;
 
         fn scoped(&self, scope: Epoch) -> Option<Scoped<TestScheme>> {
-            self.epochs
-                .contains_key(&scope)
-                .then(|| Scoped::scheme(self.scheme.clone()))
+            self.schemes.get(&scope).cloned().map(Scoped::scheme)
+        }
+    }
+
+    #[derive(Clone)]
+    struct NoopBlocker;
+
+    impl Blocker for NoopBlocker {
+        type PublicKey = PublicKey;
+
+        fn block(&mut self, _: Self::PublicKey) -> Feedback {
+            Feedback::Ok
+        }
+    }
+
+    #[derive(Clone)]
+    struct PendingApplication;
+
+    impl Automaton for PendingApplication {
+        type Context = Height;
+        type Digest = TestDigest;
+
+        async fn propose(
+            &mut self,
+            _: Height,
+        ) -> commonware_utils::channel::oneshot::Receiver<Self::Digest> {
+            commonware_utils::channel::oneshot::channel().1
+        }
+
+        async fn verify(
+            &mut self,
+            _: Height,
+            _: Self::Digest,
+        ) -> commonware_utils::channel::oneshot::Receiver<bool> {
+            commonware_utils::channel::oneshot::channel().1
+        }
+    }
+
+    #[derive(Clone)]
+    struct NoopReporter;
+
+    impl Reporter for NoopReporter {
+        type Activity = Certificate<TestScheme, TestDigest>;
+
+        fn report(&mut self, _: Self::Activity) -> Feedback {
+            Feedback::Ok
         }
     }
 
@@ -415,12 +473,16 @@ mod tests {
         }
     }
 
-    fn key(namespace: RecoveryNamespace, position: u64) -> RecoveryKey {
+    fn key_at(namespace: RecoveryNamespace, epoch: Epoch, position: u64) -> RecoveryKey {
         RecoveryKey {
             namespace,
-            epoch: Epoch::new(1),
-            position: commonware_consensus::types::Height::new(position),
+            epoch,
+            position: Height::new(position),
         }
+    }
+
+    fn key(namespace: RecoveryNamespace, position: u64) -> RecoveryKey {
+        key_at(namespace, Epoch::new(1), position)
     }
 
     fn delivery(key: RecoveryKey) -> Delivery<RecoveryKey, ()> {
@@ -428,6 +490,57 @@ mod tests {
             key,
             subscribers: non_empty_vec![((), tracing::Span::none())],
         }
+    }
+
+    fn certificate(
+        schemes: &[TestScheme],
+        epoch: Epoch,
+        position: Height,
+    ) -> Certificate<TestScheme, TestDigest> {
+        let item = Item {
+            position,
+            digest: Sha256::hash(&[&position.get().to_be_bytes()]),
+        };
+        let acks: Vec<_> = schemes
+            .iter()
+            .filter_map(|scheme| Ack::sign(scheme, item.clone()))
+            .collect();
+        Certificate::from_acks(&schemes[0], epoch, non_empty![@acks.iter()], &Sequential).unwrap()
+    }
+
+    fn unstarted_engine(
+        context: &deterministic::Context,
+        scheme: TestScheme,
+        epoch: Epoch,
+        first: Height,
+        last: Height,
+        partition: &str,
+    ) -> (impl Sized, Mailbox<TestScheme, TestDigest>) {
+        let (engine, mailbox) = Engine::new(
+            context.child("engine"),
+            EngineConfig {
+                epoch,
+                first,
+                last,
+                scheme,
+                automaton: PendingApplication,
+                reporter: NoopReporter,
+                blocker: NoopBlocker,
+                priority_acks: false,
+                rebroadcast_timeout: NonZeroDuration::new_panic(Duration::from_secs(1)),
+                recovery_after_rebroadcasts: NZU64!(1),
+                recoverer: RecordingRecoverer::default(),
+                window: NZU64!(1),
+                journal_partition: partition.into(),
+                journal_write_buffer: NZUsize!(4096),
+                journal_replay_buffer: NZUsize!(4096),
+                journal_heights_per_section: NZU64!(4),
+                journal_compression: None,
+                journal_page_cache: CacheRef::from_pooler(context, NZU16!(1024), NZUsize!(10)),
+                strategy: Sequential,
+            },
+        );
+        (engine, mailbox)
     }
 
     #[test_traced]
@@ -446,7 +559,7 @@ mod tests {
             let provider = TestProvider {
                 namespace,
                 epochs: Arc::new(epochs),
-                scheme,
+                schemes: Arc::new(BTreeMap::from([(Epoch::new(1), scheme)])),
             };
             let (history_actor, mut history) =
                 HistoryActor::<_, TestScheme, TestDigest, _, _>::init(
@@ -535,6 +648,235 @@ mod tests {
                     .unwrap(),
                 Outcome::Ambiguous
             );
+        });
+    }
+
+    #[test_traced]
+    fn registered_route_retries_when_engine_mailbox_is_backpressured() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let fixture = scheme::ed25519::fixture(&mut context, b"router-engine-full", 4);
+            let scheme = Arc::new(fixture.schemes[0].clone());
+            let namespace = <TestScheme as Scheme<TestDigest>>::recovery_namespace(&scheme);
+            let epoch = Epoch::new(1);
+            let position = Height::new(10);
+            let authenticated =
+                AuthenticatedEpoch::new(scheme.clone(), position, position).unwrap();
+            let provider = TestProvider {
+                namespace,
+                epochs: Arc::new(BTreeMap::from([(epoch, authenticated)])),
+                schemes: Arc::new(BTreeMap::from([(epoch, scheme.clone())])),
+            };
+            let (history_actor, history) = HistoryActor::<_, TestScheme, TestDigest, _, _>::init(
+                context.child("history"),
+                history_config(
+                    &context,
+                    namespace,
+                    fixture.schemes[0].certificate_codec_config(),
+                ),
+                provider.clone(),
+                Sequential,
+            )
+            .await
+            .unwrap();
+            let history_task = history_actor.start();
+            let recoverer = RecordingRecoverer::default();
+            let canceled = recoverer.0.clone();
+            let (router, mut handler, mut registry) = Actor::new(
+                context.child("router"),
+                history,
+                provider,
+                recoverer,
+                NZUsize!(8),
+            );
+            let router_task = router.start();
+
+            let (engine, mailbox) = unstarted_engine(
+                &context,
+                fixture.schemes[0].clone(),
+                epoch,
+                position,
+                position,
+                "router_engine_full",
+            );
+            let mut occupied_mailbox = mailbox.clone();
+            let occupied_certificate = certificate(&fixture.schemes, epoch, position);
+            let occupied = context
+                .child("occupied")
+                .spawn(move |_| async move { occupied_mailbox.submit(occupied_certificate).await });
+            context.sleep(Duration::from_millis(1)).await;
+            assert!(registry.register(namespace, epoch, mailbox).accepted());
+
+            let recovery_key = key_at(namespace, epoch, position.get());
+            assert_eq!(
+                handler
+                    .deliver(
+                        delivery(recovery_key),
+                        certificate(&fixture.schemes, epoch, position).encode(),
+                    )
+                    .await
+                    .unwrap(),
+                Outcome::Ambiguous
+            );
+            assert!(canceled.lock().is_empty());
+
+            drop(engine);
+            assert_eq!(occupied.await.unwrap(), CertificateOutcome::Ignored);
+            context.child("stop").stop(0, None).await.unwrap();
+            router_task.await.unwrap();
+            history_task.await.unwrap().unwrap();
+        });
+    }
+
+    #[test_traced]
+    fn registered_route_rejects_missing_or_mismatched_authentication() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let fixture = scheme::ed25519::fixture(&mut context, b"router-authentication", 4);
+            let scheme = Arc::new(fixture.schemes[0].clone());
+            let namespace = <TestScheme as Scheme<TestDigest>>::recovery_namespace(&scheme);
+            let epoch = Epoch::new(1);
+            let position = Height::new(10);
+            let authenticated =
+                AuthenticatedEpoch::new(scheme.clone(), position, position).unwrap();
+            let provider = TestProvider {
+                namespace,
+                epochs: Arc::new(BTreeMap::from([(epoch, authenticated)])),
+                schemes: Arc::new(BTreeMap::from([(epoch, scheme.clone())])),
+            };
+            let (history_actor, history) = HistoryActor::<_, TestScheme, TestDigest, _, _>::init(
+                context.child("history"),
+                history_config(
+                    &context,
+                    namespace,
+                    fixture.schemes[0].certificate_codec_config(),
+                ),
+                provider.clone(),
+                Sequential,
+            )
+            .await
+            .unwrap();
+            let history_task = history_actor.start();
+            let recoverer = RecordingRecoverer::default();
+            let canceled = recoverer.0.clone();
+            let (mut router, _, _) = Actor::new(
+                context.child("router"),
+                history,
+                provider,
+                recoverer,
+                NZUsize!(4),
+            );
+            let (engine, mailbox) = unstarted_engine(
+                &context,
+                fixture.schemes[0].clone(),
+                epoch,
+                position,
+                position,
+                "router_authentication",
+            );
+            router.routes.insert((namespace, epoch), mailbox);
+            let recovery_key = key_at(namespace, epoch, position.get());
+            let value = certificate(&fixture.schemes, epoch, position).encode();
+
+            router.provider.schemes = Arc::new(BTreeMap::new());
+            let (response, outcome) = commonware_utils::channel::oneshot::channel();
+            router
+                .route(
+                    delivery(recovery_key),
+                    value.clone(),
+                    DeliveryResponse::new(response),
+                )
+                .await;
+            assert_eq!(outcome.await.unwrap(), Outcome::Ignored);
+
+            router.provider.schemes = Arc::new(BTreeMap::from([(epoch, scheme.clone())]));
+            router.provider.epochs = Arc::new(BTreeMap::new());
+            let (response, outcome) = commonware_utils::channel::oneshot::channel();
+            router
+                .route(
+                    delivery(recovery_key),
+                    value.clone(),
+                    DeliveryResponse::new(response),
+                )
+                .await;
+            assert_eq!(outcome.await.unwrap(), Outcome::Ignored);
+
+            router.provider.epochs = Arc::new(BTreeMap::from([(
+                epoch,
+                AuthenticatedEpoch::new(scheme, Height::new(11), Height::new(11)).unwrap(),
+            )]));
+            let (response, outcome) = commonware_utils::channel::oneshot::channel();
+            router
+                .route(
+                    delivery(recovery_key),
+                    value,
+                    DeliveryResponse::new(response),
+                )
+                .await;
+            assert_eq!(outcome.await.unwrap(), Outcome::Invalid);
+            assert!(canceled.lock().is_empty());
+
+            drop(engine);
+            context.child("stop").stop(0, None).await.unwrap();
+            history_task.await.unwrap().unwrap();
+        });
+    }
+
+    #[test_traced]
+    fn history_backpressure_retries_delivery_without_canceling_recovery() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let fixture = scheme::ed25519::fixture(&mut context, b"router-history-backpressure", 1);
+            let scheme = Arc::new(fixture.schemes[0].clone());
+            let namespace = <TestScheme as Scheme<TestDigest>>::recovery_namespace(&scheme);
+            let position = commonware_consensus::types::Height::new(1);
+            let mut epochs = BTreeMap::new();
+            epochs.insert(
+                Epoch::new(1),
+                AuthenticatedEpoch::new(scheme.clone(), position, position).unwrap(),
+            );
+            let provider = TestProvider {
+                namespace,
+                epochs: Arc::new(epochs),
+                schemes: Arc::new(BTreeMap::from([(Epoch::new(1), scheme)])),
+            };
+            let mut config = history_config(
+                &context,
+                namespace,
+                fixture.schemes[0].certificate_codec_config(),
+            );
+            config.mailbox_size = NZUsize!(1);
+            let (_history_actor, mut history) =
+                HistoryActor::<_, TestScheme, TestDigest, _, _>::init(
+                    context.child("history"),
+                    config,
+                    provider.clone(),
+                    Sequential,
+                )
+                .await
+                .unwrap();
+
+            let recovery_key = key(namespace, 1);
+            let _occupied = history.deliver(delivery(recovery_key), Bytes::new());
+            let recoverer = RecordingRecoverer::default();
+            let canceled = recoverer.0.clone();
+            let (router, mut handler, _registry) = Actor::<_, TestScheme, TestDigest, _, _>::new(
+                context.child("router"),
+                history,
+                provider,
+                recoverer,
+                NZUsize!(1),
+            );
+            let router_task = router.start();
+
+            assert_eq!(
+                handler
+                    .deliver(delivery(recovery_key), Bytes::new())
+                    .await
+                    .unwrap(),
+                Outcome::Ambiguous
+            );
+            assert!(canceled.lock().is_empty());
+
+            context.child("stop").stop(0, None).await.unwrap();
+            router_task.await.unwrap();
         });
     }
 }

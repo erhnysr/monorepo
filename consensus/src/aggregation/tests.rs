@@ -150,6 +150,37 @@ where
     }
 }
 
+#[derive(Debug)]
+struct CountingReceiver<R: P2pReceiver> {
+    inner: R,
+    processed: Arc<Mutex<usize>>,
+    last_returned: bool,
+}
+
+impl<R: P2pReceiver> CountingReceiver<R> {
+    fn new(inner: R, processed: Arc<Mutex<usize>>) -> Self {
+        Self {
+            inner,
+            processed,
+            last_returned: false,
+        }
+    }
+}
+
+impl<R: P2pReceiver> P2pReceiver for CountingReceiver<R> {
+    type Error = R::Error;
+    type PublicKey = R::PublicKey;
+
+    async fn recv(&mut self) -> Result<Message<Self::PublicKey>, Self::Error> {
+        if self.last_returned {
+            *self.processed.lock() += 1;
+        }
+        let result = self.inner.recv().await;
+        self.last_returned = result.is_ok();
+        result
+    }
+}
+
 impl Automaton for ClosedApplication {
     type Context = Height;
     type Digest = Sha256Digest;
@@ -497,6 +528,231 @@ fn test_delayed_digest_broadcasts_quorum_share() {
     });
 }
 
+#[test_traced("INFO")]
+fn test_ack_validation_ignores_non_blockable_inputs() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 4);
+        let epoch = Epoch::new(81);
+        let position = Height::new(410);
+        let victim = fixture.participants[0].clone();
+        let first_peer = fixture.participants[1].clone();
+        let second_peer = fixture.participants[2].clone();
+        let observer = fixture.participants[3].clone();
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, true).await;
+        let application = ImmediateApplication::default();
+        let requested = application.requested.clone();
+        let reporter = RecordingReporter::default();
+        let certificates = reporter.certificates.clone();
+        let cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            application,
+            reporter,
+            oracle.control(victim.clone()),
+            EngineScope {
+                partition: "aggregation-ack-non-blockable".into(),
+                epoch,
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        let (engine, _mailbox) = Engine::new(context.child("engine"), cfg);
+        let (sender, receiver) = registrations.remove(&victim).unwrap();
+        let processed = Arc::new(Mutex::new(0));
+        let receiver = CountingReceiver::new(receiver, processed.clone());
+        let handle = engine.start((sender, receiver));
+        let (mut first_sender, _) = registrations.remove(&first_peer).unwrap();
+        let (mut second_sender, _) = registrations.remove(&second_peer).unwrap();
+        let (_, mut observer_receiver) = registrations.remove(&observer).unwrap();
+
+        while !requested.lock().contains(&position) {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        observer_receiver.recv().await.unwrap();
+
+        let outside = Ack::sign(
+            &fixture.schemes[1],
+            Item {
+                position: position.next(),
+                digest: digest(position.next()),
+            },
+        )
+        .unwrap();
+        first_sender.send(
+            Recipients::One(victim.clone()),
+            outside.clone().encode(),
+            false,
+        );
+        first_sender.send(Recipients::One(victim.clone()), outside.encode(), false);
+        while *processed.lock() < 1 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+
+        let first_valid = Ack::sign(
+            &fixture.schemes[1],
+            Item {
+                position,
+                digest: digest(position),
+            },
+        )
+        .unwrap();
+        first_sender.send(
+            Recipients::One(victim.clone()),
+            first_valid.clone().encode(),
+            false,
+        );
+        while *processed.lock() < 2 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        first_sender.send(
+            Recipients::One(victim.clone()),
+            first_valid.clone().encode(),
+            false,
+        );
+        while *processed.lock() < 3 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        first_sender.send(Recipients::One(victim.clone()), first_valid.encode(), false);
+        while *processed.lock() < 4 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+
+        let wrong_digest = Ack::sign(
+            &fixture.schemes[2],
+            Item {
+                position,
+                digest: Sha256::hash(&[b"wrong ack digest"]),
+            },
+        )
+        .unwrap();
+        second_sender.send(
+            Recipients::One(victim.clone()),
+            wrong_digest.clone().encode(),
+            false,
+        );
+        while *processed.lock() < 5 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        second_sender.send(
+            Recipients::One(victim.clone()),
+            wrong_digest.encode(),
+            false,
+        );
+        while *processed.lock() < 6 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+
+        let second_valid = Ack::sign(
+            &fixture.schemes[2],
+            Item {
+                position,
+                digest: digest(position),
+            },
+        )
+        .unwrap();
+        second_sender.send(Recipients::One(victim), second_valid.encode(), false);
+        while *processed.lock() < 7 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+
+        assert!(oracle.blocked().await.unwrap().is_empty());
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Completed
+        );
+        let certificates = certificates.lock();
+        assert_eq!(certificates.len(), 1);
+        assert_eq!(certificates[0].item.position, position);
+        assert_eq!(certificates[0].item.digest, digest(position));
+    });
+}
+
+#[test_traced("INFO")]
+fn test_ack_validation_blocks_peer_mismatch_and_invalid_signature() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 4);
+        let epoch = Epoch::new(82);
+        let position = Height::new(420);
+        let victim = fixture.participants[0].clone();
+        let mismatched_peer = fixture.participants[2].clone();
+        let forging_peer = fixture.participants[3].clone();
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, true).await;
+        let application = PendingApplication::default();
+        let requested = application.requested.clone();
+        let cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            application,
+            RecordingReporter::default(),
+            oracle.control(victim.clone()),
+            EngineScope {
+                partition: "aggregation-ack-blockable".into(),
+                epoch,
+                first: position,
+                last: position,
+                window: 1,
+            },
+        );
+        let (engine, mut mailbox) = Engine::new(context.child("engine"), cfg);
+        let handle = engine.start(registrations.remove(&victim).unwrap());
+
+        while !requested.lock().contains_key(&position) {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+
+        let mismatched = Ack::sign(
+            &fixture.schemes[1],
+            Item {
+                position,
+                digest: digest(position),
+            },
+        )
+        .unwrap();
+        let (mut mismatched_sender, _) = registrations.remove(&mismatched_peer).unwrap();
+        mismatched_sender.send(Recipients::One(victim.clone()), mismatched.encode(), false);
+        while !oracle
+            .blocked()
+            .await
+            .unwrap()
+            .contains(&(victim.clone(), mismatched_peer.clone()))
+        {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+
+        let mut forged = Ack::sign(
+            &fixture.schemes[3],
+            Item {
+                position,
+                digest: digest(position),
+            },
+        )
+        .unwrap();
+        forged.item.digest = Sha256::hash(&[b"forged ack"]);
+        let (mut forging_sender, _) = registrations.remove(&forging_peer).unwrap();
+        forging_sender.send(Recipients::One(victim.clone()), forged.encode(), false);
+        while !oracle
+            .blocked()
+            .await
+            .unwrap()
+            .contains(&(victim.clone(), forging_peer.clone()))
+        {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+
+        assert_eq!(
+            mailbox.submit(certificate(&fixture, epoch, position)).await,
+            CertificateOutcome::Accepted
+        );
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Completed
+        );
+    });
+}
+
 fn certificate_ingress<S, F>(fixture: F)
 where
     S: Scheme<Sha256Digest, PublicKey = PublicKey>,
@@ -585,6 +841,116 @@ where
 #[test_traced("INFO")]
 fn test_certificate_ingress_cancels_digest() {
     certificate_ingress(scheme::ed25519::fixture);
+}
+
+#[test_traced("INFO")]
+fn test_external_certificate_outcomes_and_recovery_window() {
+    deterministic::Runner::timed(Duration::from_secs(10)).start(|mut context| async move {
+        let fixture = scheme::ed25519::fixture(&mut context, NAMESPACE, 4);
+        let epoch = Epoch::new(89);
+        let first = Height::new(490);
+        let second = first.next();
+        let third = second.next();
+        let participant = fixture.participants[0].clone();
+        let (oracle, mut registrations) =
+            simulation(context.child("simulation"), &fixture, false).await;
+        let recoverer = RecordingRecoverer::default();
+        let events = recoverer.events.clone();
+        let mut cfg = config(
+            &context,
+            fixture.schemes[0].clone(),
+            PendingApplication::default(),
+            RecordingReporter::default(),
+            oracle.control(participant.clone()),
+            EngineScope {
+                partition: "aggregation-external-outcomes".into(),
+                epoch,
+                first,
+                last: third,
+                window: 2,
+            },
+        );
+        cfg.recovery_after_rebroadcasts = NonZeroU64::new(1).unwrap();
+        cfg.recoverer = recoverer;
+        let (engine, mut mailbox) = Engine::new(context.child("engine"), cfg);
+        let handle = engine.start(registrations.remove(&participant).unwrap());
+
+        while events.lock().iter().filter(|(fetch, _)| *fetch).count() < 2 {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+
+        let mut wrong_epoch = certificate(&fixture, epoch, second);
+        wrong_epoch.epoch = epoch.next();
+        assert_eq!(
+            mailbox.submit(wrong_epoch).await,
+            CertificateOutcome::Invalid
+        );
+        assert_eq!(
+            mailbox
+                .submit(certificate(&fixture, epoch, Height::new(first.get() - 1)))
+                .await,
+            CertificateOutcome::Invalid
+        );
+        assert_eq!(
+            mailbox
+                .submit(certificate(&fixture, epoch, third.next()))
+                .await,
+            CertificateOutcome::Invalid
+        );
+
+        let mut invalid_signature = certificate(&fixture, epoch, second);
+        invalid_signature.item.digest = Sha256::hash(&[b"invalid certificate"]);
+        assert_eq!(
+            mailbox.submit(invalid_signature).await,
+            CertificateOutcome::Invalid
+        );
+        assert_eq!(
+            mailbox.submit(certificate(&fixture, epoch, third)).await,
+            CertificateOutcome::Ignored
+        );
+        assert_eq!(
+            mailbox.submit(certificate(&fixture, epoch, second)).await,
+            CertificateOutcome::Accepted
+        );
+        assert_eq!(
+            mailbox.submit(certificate(&fixture, epoch, second)).await,
+            CertificateOutcome::Ignored
+        );
+
+        let first_key = RecoveryKey {
+            namespace: RecoveryNamespace::derive(NAMESPACE),
+            epoch,
+            position: first,
+        };
+        let second_key = RecoveryKey {
+            position: second,
+            ..first_key
+        };
+        assert!(events.lock().contains(&(false, second_key)));
+        assert!(!events.lock().contains(&(false, first_key)));
+
+        assert_eq!(
+            mailbox.submit(certificate(&fixture, epoch, first)).await,
+            CertificateOutcome::Accepted
+        );
+        let third_key = RecoveryKey {
+            position: third,
+            ..first_key
+        };
+        while !events.lock().contains(&(true, third_key)) {
+            context.sleep(Duration::from_millis(1)).await;
+        }
+        assert!(events.lock().contains(&(false, first_key)));
+        assert_eq!(
+            mailbox.submit(certificate(&fixture, epoch, third)).await,
+            CertificateOutcome::Accepted
+        );
+        assert_eq!(
+            handle.await.expect("aggregation engine failed"),
+            EngineOutcome::Completed
+        );
+        assert!(events.lock().contains(&(false, third_key)));
+    });
 }
 
 #[test_traced("INFO")]

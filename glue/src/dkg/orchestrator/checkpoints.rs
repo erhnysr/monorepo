@@ -422,7 +422,6 @@ where
 mod tests {
     use super::*;
     use crate::dkg::tests::mocks::MockBlock;
-    use commonware_consensus::Heightable as _;
     use commonware_cryptography::{
         Digestible as _, Hasher as _, Sha256, sha256::Digest as Sha256Digest,
     };
@@ -439,13 +438,17 @@ mod tests {
         type Checkpoint = Sha256Digest;
 
         fn finalized_checkpoint(&self) -> (Height, Self::Checkpoint) {
-            (self.height(), self.digest())
+            (Height::new(*self.context()), self.digest())
         }
     }
 
     fn block(height: u64, timestamp: u64) -> TestBlock {
+        checkpoint_block(height, height, timestamp)
+    }
+
+    fn checkpoint_block(height: u64, checkpoint_height: u64, timestamp: u64) -> TestBlock {
         MockBlock::new::<Sha256>(
-            timestamp,
+            checkpoint_height,
             Sha256::hash(&[b"parent"]),
             Height::new(height),
             timestamp,
@@ -537,6 +540,47 @@ mod tests {
                 })) if height == Height::new(3)
             ));
             assert!(conflict_waiter.await.is_err());
+        });
+    }
+
+    #[test]
+    fn checkpoint_height_mismatch_is_fatal_and_not_persisted() {
+        deterministic::Runner::default().start(|context| async move {
+            let (actor, mut handler) =
+                Actor::<_, TestBlock, Exact>::init(context.child("first"), config(&context))
+                    .await
+                    .unwrap();
+            let handle = actor.start();
+            let (acknowledgement, acknowledged) = Exact::handle();
+            let _ = handler.report(Update::Block(
+                Arc::new(checkpoint_block(3, 4, 1)),
+                acknowledgement,
+            ));
+
+            assert!(matches!(
+                handle.await,
+                Ok(Err(Error::HeightMismatch { checkpoint, block }))
+                    if checkpoint == Height::new(4) && block == Height::new(3)
+            ));
+            assert!(acknowledged.await.is_err());
+
+            let (actor, mut handler) =
+                Actor::<_, TestBlock, Exact>::init(context.child("second"), config(&context))
+                    .await
+                    .unwrap();
+            let handle = actor.start();
+            let proposal = handler.propose(Height::new(4)).await;
+            reschedule().await;
+            assert!(proposal.now_or_never().is_none());
+
+            let expected = block(4, 2);
+            let digest = expected.digest();
+            let proposal = handler.propose(Height::new(4)).await;
+            let (acknowledgement, acknowledged) = Exact::handle();
+            let _ = handler.report(Update::Block(Arc::new(expected), acknowledgement));
+            assert_eq!(proposal.await.unwrap(), digest);
+            acknowledged.await.unwrap();
+            handle.abort();
         });
     }
 

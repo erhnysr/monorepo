@@ -163,8 +163,8 @@ pub struct Config<C> {
     pub archive: immutable::Config<C>,
     /// Retirement marker and namespace-floor metadata configuration.
     pub metadata: metadata::Config<()>,
-    /// Capacity of the ingress queue. Overflowed resolver deliveries are ignored;
-    /// other overflowed requests receive a canceled response and must be retried.
+    /// Capacity of the ingress queue. Overflowed resolver deliveries are retried;
+    /// other overflowed requests receive a canceled response and must also be retried.
     pub mailbox_size: NonZeroUsize,
 }
 
@@ -396,7 +396,7 @@ impl Policy for Message {
     fn handle(overflow: &mut Self::Overflow, message: Self) {
         let _ = overflow;
         if let Self::Deliver { response, .. } = message {
-            response.send(Outcome::Ignored);
+            response.send(Outcome::Ambiguous);
         }
     }
 }
@@ -934,6 +934,7 @@ where
 mod tests {
     use super::*;
     use commonware_actor::Feedback;
+    use commonware_codec::DecodeExt as _;
     use commonware_consensus::aggregation::{
         scheme,
         types::{Ack, Certificate, Item},
@@ -1044,6 +1045,41 @@ mod tests {
             epoch: Epoch::new(epoch),
             position: Height::new(position),
         }
+    }
+
+    #[test]
+    fn retirement_metadata_codec_and_labels_are_stable() {
+        let namespace = RecoveryNamespace::derive(b"metadata-codec");
+        let retirement = Retirement {
+            namespace,
+            epoch: Epoch::new(3),
+            first: Height::new(10),
+            last: Height::new(19),
+        };
+        let keys = [
+            MetadataKey::Marker(retirement),
+            MetadataKey::Floor(namespace),
+            MetadataKey::Cleanup(retirement),
+        ];
+        for key in keys {
+            let encoded = key.encode();
+            assert_eq!(MetadataKey::decode(encoded).unwrap(), key);
+            assert!(!key.to_string().is_empty());
+        }
+        assert!(MetadataKey::decode(Bytes::from_static(&[3])).is_err());
+
+        for value in [
+            MetadataValue::Marker,
+            MetadataValue::Floor(Epoch::new(4)),
+            MetadataValue::Exhausted,
+        ] {
+            let encoded = value.encode();
+            assert_eq!(
+                MetadataValue::decode(encoded.clone()).unwrap().encode(),
+                encoded
+            );
+        }
+        assert!(MetadataValue::decode(Bytes::from_static(&[3])).is_err());
     }
 
     #[test_traced]
@@ -1292,7 +1328,7 @@ mod tests {
     }
 
     #[test_traced]
-    fn bounded_ingress_ignores_delivery_on_backpressure() {
+    fn bounded_ingress_retries_delivery_on_backpressure() {
         deterministic::Runner::default().start(|context| async move {
             let (sender, _receiver) = mailbox::new(context, NZUsize!(1));
             let mut handler = Handler { sender };
@@ -1307,7 +1343,7 @@ mod tests {
                 Consumer::deliver(&mut handler, delivery, Bytes::new())
                     .await
                     .unwrap(),
-                Outcome::Ignored
+                Outcome::Ambiguous
             );
             assert_eq!(
                 handler.sender.enqueue(Message::Produce {
@@ -1316,6 +1352,350 @@ mod tests {
                 }),
                 Feedback::Backoff
             );
+        });
+    }
+
+    #[test_traced]
+    fn authenticated_requests_reject_untrusted_identity() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let fixture = scheme::ed25519::fixture(&mut context, b"authenticated-history", 4);
+            let schemes = fixture.schemes;
+            let rogue = scheme::ed25519::fixture(&mut context, b"rogue-history", 4).schemes;
+            let namespace =
+                <TestScheme as scheme::Scheme<TestDigest>>::recovery_namespace(&schemes[0]);
+            let rogue_namespace =
+                <TestScheme as scheme::Scheme<TestDigest>>::recovery_namespace(&rogue[0]);
+            assert_ne!(namespace, rogue_namespace);
+            assert!(
+                AuthenticatedEpoch::new(
+                    Arc::new(schemes[0].clone()),
+                    Height::new(11),
+                    Height::new(10),
+                )
+                .is_none()
+            );
+
+            let mut epochs = BTreeMap::new();
+            epochs.insert(
+                Epoch::new(1),
+                AuthenticatedEpoch::new(
+                    Arc::new(schemes[0].clone()),
+                    Height::new(10),
+                    Height::new(11),
+                )
+                .unwrap(),
+            );
+            // The provider is application-owned, but the actor still verifies that its scheme
+            // derives the configured namespace.
+            epochs.insert(
+                Epoch::new(2),
+                AuthenticatedEpoch::new(
+                    Arc::new(rogue[0].clone()),
+                    Height::new(20),
+                    Height::new(20),
+                )
+                .unwrap(),
+            );
+            let provider = TestProvider {
+                namespace,
+                epochs: Arc::new(epochs),
+                oldest: Epoch::new(1),
+            };
+            let (actor, mut handler) = Actor::<_, TestScheme, TestDigest, _, _>::init(
+                context.child("history"),
+                storage_config(&context, namespace, schemes[0].certificate_codec_config()),
+                provider,
+                Sequential,
+            )
+            .await
+            .unwrap();
+            let task = actor.start();
+
+            let ten = certificate(&schemes, Epoch::new(1), Height::new(10)).encode();
+            for rejected in [
+                key(namespace, 9, 10),
+                key(namespace, 1, 9),
+                key(namespace, 1, 12),
+                key(namespace, 1, 11),
+                key(rogue_namespace, 1, 10),
+            ] {
+                assert_eq!(
+                    handler.archive(rejected, ten.clone()).await.unwrap(),
+                    ArchiveStatus::Rejected
+                );
+            }
+            let rogue_twenty = certificate(&rogue, Epoch::new(2), Height::new(20)).encode();
+            assert_eq!(
+                handler
+                    .archive(key(namespace, 2, 20), rogue_twenty)
+                    .await
+                    .unwrap(),
+                ArchiveStatus::Rejected
+            );
+
+            let delivery = Delivery {
+                key: key(namespace, 9, 10),
+                subscribers: non_empty_vec![((), tracing::Span::none())],
+            };
+            assert_eq!(
+                Consumer::deliver(&mut handler, delivery, ten.clone())
+                    .await
+                    .unwrap(),
+                Outcome::Invalid
+            );
+            assert_eq!(
+                handler
+                    .archive(key(namespace, 1, 10), ten.clone())
+                    .await
+                    .unwrap(),
+                ArchiveStatus::Stored
+            );
+            assert!(
+                Producer::produce(&mut handler, key(rogue_namespace, 1, 10))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                Producer::produce(&mut handler, key(namespace, 2, 10))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                Producer::produce(&mut handler, key(namespace, 1, 10))
+                    .await
+                    .unwrap(),
+                ten
+            );
+
+            drop(handler);
+            task.await.unwrap().unwrap();
+        });
+    }
+
+    #[test_traced]
+    fn sparse_missing_height_discovery_honors_range_and_limit() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let fixture = scheme::ed25519::fixture(&mut context, b"sparse-history", 4);
+            let schemes = fixture.schemes;
+            let namespace =
+                <TestScheme as scheme::Scheme<TestDigest>>::recovery_namespace(&schemes[0]);
+            let ranges = [(0, 5, 5), (1, 10, 15), (2, 20, 20)];
+            let epochs = ranges
+                .into_iter()
+                .map(|(epoch, first, last)| {
+                    (
+                        Epoch::new(epoch),
+                        AuthenticatedEpoch::new(
+                            Arc::new(schemes[0].clone()),
+                            Height::new(first),
+                            Height::new(last),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            let provider = TestProvider {
+                namespace,
+                epochs: Arc::new(epochs),
+                oldest: Epoch::new(0),
+            };
+            let (actor, mut handler) = Actor::<_, TestScheme, TestDigest, _, _>::init(
+                context.child("history"),
+                storage_config(&context, namespace, schemes[0].certificate_codec_config()),
+                provider,
+                Sequential,
+            )
+            .await
+            .unwrap();
+            let task = actor.start();
+
+            for (epoch, position) in [(0, 5), (1, 10), (1, 12), (1, 13), (1, 15), (2, 20)] {
+                let value =
+                    certificate(&schemes, Epoch::new(epoch), Height::new(position)).encode();
+                assert_eq!(
+                    handler
+                        .archive(key(namespace, epoch, position), value)
+                        .await
+                        .unwrap(),
+                    ArchiveStatus::Stored
+                );
+            }
+            let target = Retirement {
+                namespace,
+                epoch: Epoch::new(1),
+                first: Height::new(10),
+                last: Height::new(15),
+            };
+            assert_eq!(
+                handler.missing(target, NZUsize!(1)).await.unwrap(),
+                vec![Height::new(11)]
+            );
+            assert_eq!(
+                handler.missing(target, NZUsize!(2)).await.unwrap(),
+                vec![Height::new(11), Height::new(14)]
+            );
+            assert_eq!(
+                handler.missing(target, NZUsize!(10)).await.unwrap(),
+                vec![Height::new(11), Height::new(14)]
+            );
+
+            for mismatched in [
+                Retirement {
+                    first: Height::new(9),
+                    ..target
+                },
+                Retirement {
+                    last: Height::new(16),
+                    ..target
+                },
+                Retirement {
+                    epoch: Epoch::new(9),
+                    ..target
+                },
+            ] {
+                assert!(
+                    handler
+                        .missing(mismatched, NZUsize!(10))
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+
+            drop(handler);
+            task.await.unwrap().unwrap();
+        });
+    }
+
+    #[test_traced]
+    fn cleanup_and_retirement_require_exact_namespace_and_range() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let fixture = scheme::ed25519::fixture(&mut context, b"scoped-cleanup-history", 4);
+            let schemes = fixture.schemes;
+            let namespace =
+                <TestScheme as scheme::Scheme<TestDigest>>::recovery_namespace(&schemes[0]);
+            let other = RecoveryNamespace::derive(b"other-cleanup-history");
+            let mut epochs = BTreeMap::new();
+            epochs.insert(
+                Epoch::new(1),
+                AuthenticatedEpoch::new(
+                    Arc::new(schemes[0].clone()),
+                    Height::new(10),
+                    Height::new(10),
+                )
+                .unwrap(),
+            );
+            epochs.insert(
+                Epoch::new(2),
+                AuthenticatedEpoch::new(
+                    Arc::new(schemes[0].clone()),
+                    Height::new(20),
+                    Height::new(20),
+                )
+                .unwrap(),
+            );
+            let provider = TestProvider {
+                namespace,
+                epochs: Arc::new(epochs),
+                oldest: Epoch::new(1),
+            };
+            let (actor, mut handler) = Actor::<_, TestScheme, TestDigest, _, _>::init(
+                context.child("history"),
+                storage_config(&context, namespace, schemes[0].certificate_codec_config()),
+                provider,
+                Sequential,
+            )
+            .await
+            .unwrap();
+            let task = actor.start();
+
+            let epoch_one = Retirement {
+                namespace,
+                epoch: Epoch::new(1),
+                first: Height::new(10),
+                last: Height::new(10),
+            };
+            let epoch_two = Retirement {
+                namespace,
+                epoch: Epoch::new(2),
+                first: Height::new(20),
+                last: Height::new(20),
+            };
+            for retirement in [epoch_one, epoch_two] {
+                let value = certificate(&schemes, retirement.epoch, retirement.first).encode();
+                assert_eq!(
+                    handler
+                        .archive(
+                            RecoveryKey {
+                                namespace,
+                                epoch: retirement.epoch,
+                                position: retirement.first,
+                            },
+                            value,
+                        )
+                        .await
+                        .unwrap(),
+                    ArchiveStatus::Stored
+                );
+                assert_eq!(
+                    handler.retire(retirement).await.unwrap(),
+                    Some(Cleanup { retirement })
+                );
+            }
+
+            let wrong_range = Retirement {
+                last: Height::new(11),
+                ..epoch_one
+            };
+            let wrong_namespace = Retirement {
+                namespace: other,
+                ..epoch_one
+            };
+            assert_eq!(handler.retire(wrong_range).await.unwrap(), None);
+            assert_eq!(handler.retire(wrong_namespace).await.unwrap(), None);
+            assert!(!handler.retired(wrong_range).await.unwrap());
+            assert!(!handler.retired(wrong_namespace).await.unwrap());
+            assert!(!handler.cleanup_complete(wrong_range).await.unwrap());
+            assert!(!handler.cleanup_complete(wrong_namespace).await.unwrap());
+            assert_eq!(handler.oldest_unretired(other).await.unwrap(), None);
+            assert!(
+                handler
+                    .pending_cleanups(other, NZUsize!(10))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                handler
+                    .pending_cleanups(namespace, NZUsize!(1))
+                    .await
+                    .unwrap(),
+                vec![Cleanup {
+                    retirement: epoch_one
+                }]
+            );
+            assert!(handler.cleanup_complete(epoch_two).await.unwrap());
+            assert_eq!(
+                handler.oldest_unretired(namespace).await.unwrap(),
+                Some(Epoch::new(1))
+            );
+            assert_eq!(
+                handler
+                    .pending_cleanups(namespace, NZUsize!(10))
+                    .await
+                    .unwrap(),
+                vec![Cleanup {
+                    retirement: epoch_one
+                }]
+            );
+            assert!(handler.cleanup_complete(epoch_one).await.unwrap());
+            assert_eq!(
+                handler.oldest_unretired(namespace).await.unwrap(),
+                Some(Epoch::new(3))
+            );
+
+            drop(handler);
+            task.await.unwrap().unwrap();
         });
     }
 

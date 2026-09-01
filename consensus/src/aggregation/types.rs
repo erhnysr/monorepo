@@ -487,6 +487,10 @@ mod tests {
         let mut rng = test_rng();
         let fixture = fixture(&mut rng, NAMESPACE, 4);
         let schemes = &fixture.schemes;
+        assert_eq!(
+            schemes[0].recovery_namespace(),
+            RecoveryNamespace::derive(NAMESPACE)
+        );
         let item = Item {
             position: Height::new(100),
             digest: Sha256::hash(&[b"test_item"]),
@@ -495,6 +499,24 @@ mod tests {
         // Test Item codec
         let restored_item = Item::decode(item.encode()).unwrap();
         assert_eq!(item, restored_item);
+        assert_eq!(item.height(), Height::new(100));
+
+        let recovery_key = RecoveryKey {
+            namespace: schemes[0].recovery_namespace(),
+            epoch: Epoch::new(1),
+            position: item.position,
+        };
+        assert_eq!(
+            RecoveryKey::decode(recovery_key.encode()).unwrap(),
+            recovery_key
+        );
+        assert_eq!(
+            recovery_key.to_string(),
+            format!(
+                "{}/{}/{}",
+                recovery_key.namespace, recovery_key.epoch, recovery_key.position
+            )
+        );
 
         // Test Ack creation and codec
         let ack = Ack::sign(&schemes[0], item.clone()).unwrap();

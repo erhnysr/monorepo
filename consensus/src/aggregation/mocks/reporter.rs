@@ -86,3 +86,55 @@ impl<S: Scheme, D: Digest> Mailbox<S, D> {
         receiver.await.unwrap()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Reporter as _,
+        aggregation::{
+            scheme::ed25519,
+            types::{Ack, Item},
+        },
+        types::{Epoch, Height},
+    };
+    use commonware_cryptography::{Hasher as _, Sha256, certificate::mocks::Fixture};
+    use commonware_parallel::Sequential;
+    use commonware_runtime::{Runner as _, deterministic};
+    use commonware_utils::{N3f1, non_empty, ordered::Quorum as _, test_rng};
+
+    #[test]
+    fn reports_and_replaces_certificates_by_height() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut rng = test_rng();
+            let Fixture { schemes, .. } = ed25519::fixture(&mut rng, b"reporter", 4);
+            let item = Item {
+                position: Height::new(7),
+                digest: Sha256::hash(&[b"digest"]),
+            };
+            let acks: Vec<_> = schemes
+                .iter()
+                .take(schemes[0].participants().quorum::<N3f1>() as usize)
+                .map(|scheme| Ack::sign(scheme, item.clone()).unwrap())
+                .collect();
+            let certificate = Certificate::from_acks(
+                &schemes[0],
+                Epoch::new(1),
+                non_empty![@acks.iter()],
+                &Sequential,
+            )
+            .unwrap();
+            let (reporter, mut mailbox) = Reporter::new(context, schemes[0].clone());
+            let handle = reporter.start();
+
+            assert!(mailbox.report(certificate.clone()).accepted());
+            let reported = mailbox.get().await.remove(&item.position).unwrap();
+            assert_eq!(reported.epoch, certificate.epoch);
+            assert_eq!(reported.item, certificate.item);
+            assert_eq!(reported.certificate, certificate.certificate);
+
+            drop(mailbox);
+            handle.await.unwrap();
+        });
+    }
+}

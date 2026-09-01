@@ -239,21 +239,31 @@ mod tests {
     use commonware_actor::Feedback;
     use commonware_codec::Read;
     use commonware_consensus::{
+        Automaton, Reporter,
         aggregation::{
-            JournalIdentity, scheme,
+            Config as EngineConfig, Engine, EngineOutcome, JournalIdentity, scheme,
             types::{Ack, Certificate, Item, RecoveryNamespace},
         },
         types::Epoch,
     };
     use commonware_cryptography::{Hasher as _, Sha256, certificate::Verifier as _};
     use commonware_macros::test_traced;
+    use commonware_p2p::simulated::{Config as NetworkConfig, Network};
     use commonware_parallel::Sequential;
     use commonware_runtime::{
-        Runner as _, Spawner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
+        Quota, Runner as _, Spawner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
     };
     use commonware_storage::{archive::immutable, metadata};
-    use commonware_utils::{NZU16, NZU64, NZUsize, non_empty, sync::Mutex};
-    use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc};
+    use commonware_utils::{
+        NZU16, NZU64, NZUsize, NonZeroDuration, channel::oneshot, non_empty, sync::Mutex,
+    };
+    use std::{
+        collections::BTreeMap,
+        num::{NonZeroU32, NonZeroU64},
+        sync::Arc,
+        task::Poll,
+        time::Duration,
+    };
 
     type TestScheme = scheme::ed25519::Scheme;
     type TestDigest = commonware_cryptography::sha256::Digest;
@@ -304,6 +314,45 @@ mod tests {
 
         fn cancel(&mut self, _: RecoveryKey) -> Feedback {
             Feedback::Closed
+        }
+    }
+
+    #[derive(Clone)]
+    struct ImmediateApplication;
+
+    impl Automaton for ImmediateApplication {
+        type Context = Height;
+        type Digest = TestDigest;
+
+        async fn propose(&mut self, position: Height) -> oneshot::Receiver<Self::Digest> {
+            let (sender, receiver) = oneshot::channel();
+            sender
+                .send(Sha256::hash(&[&position.get().to_be_bytes()]))
+                .unwrap();
+            receiver
+        }
+
+        async fn verify(
+            &mut self,
+            position: Height,
+            candidate: Self::Digest,
+        ) -> oneshot::Receiver<bool> {
+            let (sender, receiver) = oneshot::channel();
+            sender
+                .send(candidate == Sha256::hash(&[&position.get().to_be_bytes()]))
+                .unwrap();
+            receiver
+        }
+    }
+
+    #[derive(Clone)]
+    struct DiscardReporter;
+
+    impl Reporter for DiscardReporter {
+        type Activity = Certificate<TestScheme, TestDigest>;
+
+        fn report(&mut self, _: Self::Activity) -> Feedback {
+            Feedback::Ok
         }
     }
 
@@ -398,6 +447,185 @@ mod tests {
             .filter_map(|scheme| Ack::sign(scheme, item.clone()))
             .collect();
         Certificate::from_acks(&schemes[0], epoch, non_empty![@acks.iter()], &Sequential).unwrap()
+    }
+
+    async fn populate_journal(
+        context: &deterministic::Context,
+        scheme: TestScheme,
+        participant: commonware_cryptography::ed25519::PublicKey,
+        partition: &str,
+        epoch: Epoch,
+        first: Height,
+        last: Height,
+    ) {
+        let (network, oracle) = Network::new_with_peers(
+            context.child("journal_network"),
+            NetworkConfig {
+                max_size: 1024 * 1024,
+                max_peers_per_set: NZUsize!(1),
+                disconnect_on_block: true,
+                tracked_peer_sets: NZUsize!(1),
+            },
+            vec![participant.clone()],
+        )
+        .await;
+        network.start();
+        let registration = oracle
+            .control(participant.clone())
+            .register(0, Quota::per_second(NonZeroU32::MAX))
+            .await
+            .unwrap();
+        let config = EngineConfig {
+            epoch,
+            first,
+            last,
+            scheme,
+            automaton: ImmediateApplication,
+            reporter: DiscardReporter,
+            blocker: oracle.control(participant),
+            priority_acks: false,
+            rebroadcast_timeout: NonZeroDuration::new_panic(Duration::from_secs(1)),
+            recovery_after_rebroadcasts: NZU64!(3),
+            recoverer: RecordingRecoverer::default(),
+            window: NZU64!(2),
+            journal_partition: partition.into(),
+            journal_write_buffer: NZUsize!(4096),
+            journal_replay_buffer: NZUsize!(4096),
+            journal_heights_per_section: NZU64!(4),
+            journal_compression: None,
+            journal_page_cache: CacheRef::from_pooler(context, NZU16!(1024), NZUsize!(10)),
+            strategy: Sequential,
+        };
+        let (engine, _) = Engine::new(context.child("journal_engine"), config);
+        assert_eq!(
+            engine.start(registration).await.unwrap(),
+            EngineOutcome::Completed
+        );
+    }
+
+    #[test_traced]
+    fn retries_backpressured_journal_replay_before_destroying_it() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let fixture = scheme::ed25519::fixture(&mut context, b"parked-replay", 1);
+            let schemes = fixture.schemes;
+            let participant = fixture.participants[0].clone();
+            let scheme = Arc::new(schemes[0].clone());
+            let namespace = <TestScheme as Scheme<TestDigest>>::recovery_namespace(&scheme);
+            let epoch = Epoch::new(1);
+            let position = Height::new(9);
+            let partition = "parked_replay_journal";
+            populate_journal(
+                &context,
+                schemes[0].clone(),
+                participant,
+                partition,
+                epoch,
+                position,
+                position,
+            )
+            .await;
+
+            let provider = provider(namespace, scheme, epoch, position, position);
+            let mut config = history_config(
+                &context,
+                namespace,
+                schemes[0].certificate_codec_config(),
+                "replay",
+            );
+            config.mailbox_size = NZUsize!(1);
+            let (history_actor, mut history) =
+                HistoryActor::<_, TestScheme, TestDigest, _, _>::init(
+                    context.child("history"),
+                    config,
+                    provider.clone(),
+                    Sequential,
+                )
+                .await
+                .unwrap();
+
+            let mut filler = history.clone();
+            {
+                let pending = filler.oldest_unretired(namespace);
+                futures::pin_mut!(pending);
+                assert!(matches!(futures::poll!(pending.as_mut()), Poll::Pending));
+            }
+            let journal_config =
+                journal_config(&context, &schemes[0], partition, epoch, position, position);
+            assert_eq!(
+                recover::<_, TestScheme, TestDigest, _, _, _, _>(
+                    context.child("backpressured"),
+                    journal_config.clone(),
+                    &provider,
+                    &mut context,
+                    &schemes[0],
+                    &Sequential,
+                    &mut history,
+                    &mut RecordingRecoverer::default(),
+                    NZUsize!(1),
+                    false,
+                )
+                .await
+                .unwrap(),
+                Outcome::Parked {
+                    journal_archived: false
+                }
+            );
+
+            let history_task = history_actor.start();
+            loop {
+                match history.oldest_unretired(namespace).await {
+                    Ok(_) => break,
+                    Err(RequestError::Backpressured) => commonware_runtime::reschedule().await,
+                    Err(RequestError::Closed) => panic!("history closed while draining ingress"),
+                }
+            }
+            assert_eq!(
+                recover::<_, TestScheme, TestDigest, _, _, _, _>(
+                    context.child("resumed"),
+                    journal_config.clone(),
+                    &provider,
+                    &mut context,
+                    &schemes[0],
+                    &Sequential,
+                    &mut history,
+                    &mut RecordingRecoverer::default(),
+                    NZUsize!(1),
+                    false,
+                )
+                .await
+                .unwrap(),
+                Outcome::Retired
+            );
+            let key = RecoveryKey {
+                namespace,
+                epoch,
+                position,
+            };
+            assert_eq!(
+                history
+                    .archive(key, certificate(&schemes, epoch, position).encode())
+                    .await
+                    .unwrap(),
+                ArchiveStatus::Duplicate
+            );
+
+            let mut replacement = journal_config;
+            replacement.identity.epoch = Epoch::new(2);
+            let (journal, certificates) = Journal::<_, TestScheme, TestDigest>::init(
+                context.child("replacement"),
+                replacement,
+                &mut context,
+                &schemes[0],
+                &Sequential,
+            )
+            .await
+            .unwrap();
+            assert!(certificates.is_empty());
+            journal.destroy().await.unwrap();
+
+            context.child("stop").stop(0, None).await.unwrap();
+            history_task.await.unwrap().unwrap();
+        });
     }
 
     #[test_traced]
@@ -533,6 +761,17 @@ mod tests {
                 position,
                 position,
             );
+            let (journal, certificates) = Journal::<_, TestScheme, TestDigest>::init(
+                context.child("journal"),
+                config.clone(),
+                &mut context,
+                &schemes[0],
+                &Sequential,
+            )
+            .await
+            .unwrap();
+            assert!(certificates.is_empty());
+            drop(journal);
             assert_eq!(
                 recover::<_, TestScheme, TestDigest, _, _, _, _>(
                     context.child("recover"),
@@ -544,7 +783,7 @@ mod tests {
                     &mut history,
                     &mut RecordingRecoverer::default(),
                     NZUsize!(1),
-                    false,
+                    true,
                 )
                 .await
                 .unwrap(),
@@ -737,6 +976,91 @@ mod tests {
             ));
             context.child("stop").stop(0, None).await.unwrap();
             task.await.unwrap().unwrap();
+        });
+    }
+
+    #[test_traced]
+    fn standalone_cleanup_requires_live_exact_authorization() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let fixture = scheme::ed25519::fixture(&mut context, b"parked-cleanup-errors", 1);
+            let scheme = Arc::new(fixture.schemes[0].clone());
+            let namespace = <TestScheme as Scheme<TestDigest>>::recovery_namespace(&scheme);
+            let epoch = Epoch::new(1);
+            let position = Height::new(50);
+            let provider = provider(namespace, scheme, epoch, position, position);
+
+            let (history_actor, mut history) =
+                HistoryActor::<_, TestScheme, TestDigest, _, _>::init(
+                    context.child("history"),
+                    history_config(
+                        &context,
+                        namespace,
+                        fixture.schemes[0].certificate_codec_config(),
+                        "cleanup_mismatch",
+                    ),
+                    provider.clone(),
+                    Sequential,
+                )
+                .await
+                .unwrap();
+            let history_task = history_actor.start();
+            assert!(matches!(
+                cleanup::<_, TestScheme, TestDigest, _, _>(
+                    context.child("mismatch"),
+                    journal_config(
+                        &context,
+                        &fixture.schemes[0],
+                        "parked_cleanup_mismatch_journal",
+                        epoch,
+                        position,
+                        position,
+                    ),
+                    &mut context,
+                    &fixture.schemes[0],
+                    &Sequential,
+                    &mut history,
+                )
+                .await,
+                Err(Error::CleanupMismatch)
+            ));
+
+            let (closed_actor, mut closed_history) =
+                HistoryActor::<_, TestScheme, TestDigest, _, _>::init(
+                    context.child("closed_history"),
+                    history_config(
+                        &context,
+                        namespace,
+                        fixture.schemes[0].certificate_codec_config(),
+                        "cleanup_closed",
+                    ),
+                    provider,
+                    Sequential,
+                )
+                .await
+                .unwrap();
+            drop(closed_actor);
+            assert!(matches!(
+                cleanup::<_, TestScheme, TestDigest, _, _>(
+                    context.child("closed"),
+                    journal_config(
+                        &context,
+                        &fixture.schemes[0],
+                        "parked_cleanup_closed_journal",
+                        epoch,
+                        position,
+                        position,
+                    ),
+                    &mut context,
+                    &fixture.schemes[0],
+                    &Sequential,
+                    &mut closed_history,
+                )
+                .await,
+                Err(Error::HistoryUnavailable)
+            ));
+
+            context.child("stop").stop(0, None).await.unwrap();
+            history_task.await.unwrap().unwrap();
         });
     }
 }

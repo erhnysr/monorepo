@@ -233,6 +233,31 @@ mod tests {
             drop(recovery);
         });
     }
+
+    #[test]
+    fn live_handles_are_closed_after_coordinator_shutdown() {
+        deterministic::Runner::default().start(|context| async move {
+            let resolver = MockResolver::default();
+            let state = resolver.state.clone();
+            let (coordinator, mut recovery) = RecoveryCoordinator::new(
+                context.child("coordinator"),
+                resolver,
+                NZUsize!(1),
+                NZUsize!(1),
+            );
+            let mut clone = recovery.clone();
+            let handle = coordinator.start();
+
+            context.child("stop").stop(0, None).await.unwrap();
+            handle.await.expect("recovery coordinator failed");
+
+            assert_eq!(recovery.fetch(key(1, 0)), Unreliable::new(Feedback::Closed));
+            assert_eq!(recovery.cancel(key(1, 0)), Feedback::Closed);
+            assert_eq!(clone.fetch(key(1, 1)), Unreliable::new(Feedback::Closed));
+            assert_eq!(clone.cancel(key(1, 1)), Feedback::Closed);
+            assert!(state.lock().events.is_empty());
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
