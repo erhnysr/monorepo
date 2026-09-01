@@ -699,8 +699,11 @@ mod tests {
         buffer::paged::CacheRef, deterministic, telemetry::metrics::count_running_tasks,
     };
     use commonware_utils::{
-        Faults, N3f1, NZU16, NZU32, NZUsize, TestRng, non_empty, ordered::Set, probability,
-        sync::Mutex, test_rng,
+        Faults, N3f1, NZU16, NZU32, NZUsize, TestRng, non_empty,
+        ordered::{Committee, Set},
+        probability,
+        sync::Mutex,
+        test_rng,
     };
     use engine::Engine;
     use futures::future::join_all;
@@ -781,6 +784,17 @@ mod tests {
 
     const PAGE_SIZE: NonZeroU16 = NZU16!(1024);
     const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(10);
+
+    fn unit_committee<P: Ord + Clone>(participants: &[P]) -> Committee<P> {
+        Committee::try_from(
+            participants
+                .iter()
+                .cloned()
+                .map(|participant| (participant, 1))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
     const TEST_QUOTA: Quota = Quota::per_second(NonZeroU32::MAX);
 
     type TestChannel = (
@@ -1602,7 +1616,7 @@ mod tests {
             link_validators(&mut oracle, &participants, Action::Link(link), None).await;
 
             let elector = RoundRobin::default();
-            let participants_set: Set<S::PublicKey> = participants.clone().try_into().unwrap();
+            let participants_set = unit_committee(&participants);
             let built_elector = elector.clone().build(&participants_set);
             let relay = Arc::new(mocks::relay::Relay::<Sha256Digest, _>::new());
             let mut reporters = Vec::new();
@@ -1823,7 +1837,7 @@ mod tests {
             engine.start(pending, recovered, resolver);
         }
 
-        let participants_set = participants.clone().try_into().unwrap();
+        let participants_set = unit_committee(&participants);
         let built_elector: elector::RoundRobinElector<ed25519::Scheme> =
             elector.build(&participants_set);
         let leader_idx = usize::from(built_elector.elect(Round::new(epoch, View::new(1)), None));
@@ -6458,7 +6472,7 @@ mod tests {
             // participant leads view 10, the group leads views 11..=12, and the
             // lone participant leads view 13.
             let epoch = Epoch::new(333);
-            let participant_set: Set<PublicKey> = participants.clone().try_into().unwrap();
+            let participant_set = unit_committee(&participants);
             let schedule = elector.clone().build(&participant_set);
             let leader_of =
                 |view: u64| usize::from(schedule.elect(Round::new(epoch, View::new(view)), None));
@@ -6668,7 +6682,7 @@ mod tests {
             // participant leads view 10, the lone participant leads view 11, and
             // the group leads views 12..=13.
             let epoch = Epoch::new(333);
-            let participant_set: Set<PublicKey> = participants.clone().try_into().unwrap();
+            let participant_set = unit_committee(&participants);
             let schedule = elector.clone().build(&participant_set);
             let leader_of =
                 |view: u64| usize::from(schedule.elect(Round::new(epoch, View::new(view)), None));
@@ -6883,7 +6897,7 @@ mod tests {
             // participant leads view 10, the group leads views 11..=12, and the
             // lone participant leads view 13.
             let epoch = Epoch::new(333);
-            let participant_set: Set<PublicKey> = participants.clone().try_into().unwrap();
+            let participant_set = unit_committee(&participants);
             let schedule = elector.clone().build(&participant_set);
             let leader_of =
                 |view: u64| usize::from(schedule.elect(Round::new(epoch, View::new(view)), None));
@@ -7120,7 +7134,7 @@ mod tests {
 
             // Choose an epoch where the same participant leads terms 1 and 5.
             let epoch = Epoch::new(2);
-            let participant_set: Set<PublicKey> = participants.clone().try_into().unwrap();
+            let participant_set = unit_committee(&participants);
             let schedule = elector.clone().build(&participant_set);
             let leader_of =
                 |view: u64| usize::from(schedule.elect(Round::new(epoch, View::new(view)), None));

@@ -11,7 +11,10 @@ use crate::{
 use commonware_cryptography::{Digest, certificate::Verification};
 use commonware_parallel::Strategy;
 use commonware_runtime::telemetry::traces::TracedExt as _;
-use commonware_utils::{non_empty, ordered::Committee};
+use commonware_utils::{
+    N3f1, non_empty,
+    ordered::{Committee, Quorum as _},
+};
 use rand::rngs::StdRng;
 use rand_core::{CryptoRng, SeedableRng};
 use std::{future::Future, mem, sync::Arc};
@@ -36,8 +39,10 @@ where
 /// Each kind certifies independently: a view can legitimately certify both
 /// a notarization and a nullification.
 struct Certification<V> {
-    /// Verified votes required to recover a certificate.
-    quorum: usize,
+    /// Verified weight required to recover a certificate.
+    quorum_weight: u64,
+    /// Participant-count target for initial vote buffer reservations.
+    reservation_capacity: usize,
     /// Whether the scheme benefits from batching signature verification.
     batchable: bool,
     /// Progress toward a certificate.
@@ -50,8 +55,12 @@ enum State<V> {
     Incomplete {
         /// Votes awaiting signature verification.
         pending: Vec<V>,
+        /// Weight of votes awaiting signature verification.
+        pending_weight: u64,
         /// Votes with verified signatures, held for certificate recovery.
         verified: Vec<V>,
+        /// Weight of votes with verified signatures.
+        verified_weight: u64,
     },
     /// A certificate exists. Further votes are dropped.
     Complete,
@@ -59,13 +68,16 @@ enum State<V> {
 
 impl<V> Certification<V> {
     /// Creates an empty [State::Incomplete] whose vote buffers allocate lazily.
-    const fn new(quorum: usize, batchable: bool) -> Self {
+    const fn new(quorum_weight: u64, reservation_capacity: usize, batchable: bool) -> Self {
         Self {
-            quorum,
+            quorum_weight,
+            reservation_capacity,
             batchable,
             state: State::Incomplete {
                 pending: Vec::new(),
+                pending_weight: 0,
                 verified: Vec::new(),
+                verified_weight: 0,
             },
         }
     }
@@ -73,9 +85,15 @@ impl<V> Certification<V> {
     /// Buffers a vote for verification (or, if already verified, for
     /// certificate recovery). The caller owns signer uniqueness. Votes that
     /// arrive after completion are dropped.
-    fn add(&mut self, vote: V, is_verified: bool) {
+    fn add(&mut self, vote: V, weight: u64, is_verified: bool) {
         // Completed certifications drop subsequent votes without allocating.
-        let State::Incomplete { pending, verified } = &mut self.state else {
+        let State::Incomplete {
+            pending,
+            pending_weight,
+            verified,
+            verified_weight,
+        } = &mut self.state
+        else {
             return;
         };
 
@@ -83,15 +101,24 @@ impl<V> Certification<V> {
         // only needs the remaining unverified slots, while a non-batchable
         // pending buffer is consumed after each vote.
         let initial_capacity = if is_verified || self.batchable {
-            self.quorum.saturating_sub(verified.len()).max(1)
+            self.reservation_capacity
+                .saturating_sub(verified.len())
+                .max(1)
         } else {
             1
         };
-        let votes = if is_verified { verified } else { pending };
+        let (votes, accumulated_weight) = if is_verified {
+            (verified, verified_weight)
+        } else {
+            (pending, pending_weight)
+        };
         if votes.capacity() == 0 {
             votes.reserve_exact(initial_capacity);
         }
         votes.push(vote);
+        *accumulated_weight = accumulated_weight
+            .checked_add(weight)
+            .expect("signer-unique vote weight cannot exceed committee weight");
     }
 
     /// Returns true if a batch verification should run: pending votes exist,
@@ -99,10 +126,19 @@ impl<V> Certification<V> {
     /// could reach it.
     const fn should_verify(&self) -> bool {
         match &self.state {
-            State::Incomplete { pending, verified } => {
+            State::Incomplete {
+                pending,
+                pending_weight,
+                verified_weight,
+                ..
+            } => {
                 !pending.is_empty()
-                    && verified.len() < self.quorum
-                    && (!self.batchable || verified.len() + pending.len() >= self.quorum)
+                    && *verified_weight < self.quorum_weight
+                    && (!self.batchable
+                        || verified_weight
+                            .checked_add(*pending_weight)
+                            .expect("signer-unique vote weight cannot exceed committee weight")
+                            >= self.quorum_weight)
             }
             State::Complete => false,
         }
@@ -118,31 +154,50 @@ impl<V> Certification<V> {
     async fn try_verify<F, Fut>(&mut self, f: F) -> Option<(usize, Vec<Participant>)>
     where
         F: FnOnce(Vec<V>, Vec<V>) -> Fut,
-        Fut: Future<Output = (Vec<V>, Vec<Participant>)>,
+        Fut: Future<Output = (Vec<V>, u64, Vec<Participant>)>,
     {
         if !self.should_verify() {
             return None;
         }
-        let State::Incomplete { pending, verified } = &mut self.state else {
+        let State::Incomplete {
+            pending,
+            pending_weight,
+            verified,
+            verified_weight,
+        } = &mut self.state
+        else {
             unreachable!("certification complete despite should_verify");
         };
         let batch = pending.len();
         let (pending, prior) = (mem::take(pending), mem::take(verified));
-        let (votes, invalid) = f(pending, prior).await;
-        let State::Incomplete { verified, .. } = &mut self.state else {
+        *pending_weight = 0;
+        *verified_weight = 0;
+        let (votes, weight, invalid) = f(pending, prior).await;
+        let State::Incomplete {
+            verified,
+            verified_weight,
+            ..
+        } = &mut self.state
+        else {
             unreachable!("certification completed mid-verification");
         };
         *verified = votes;
+        *verified_weight = weight;
         Some((batch, invalid))
     }
 
     /// Completes with a verified quorum, surrendering it for certificate
     /// recovery, or `None` if the quorum is unmet.
     fn try_complete(&mut self) -> Option<Vec<V>> {
-        let State::Incomplete { verified, .. } = &mut self.state else {
+        let State::Incomplete {
+            verified,
+            verified_weight,
+            ..
+        } = &mut self.state
+        else {
             return None;
         };
-        if verified.len() < self.quorum {
+        if *verified_weight < self.quorum_weight {
             return None;
         }
         let votes = mem::take(verified);
@@ -161,10 +216,18 @@ impl<V> Certification<V> {
     }
 
     /// Retains only the votes matching `f`.
-    fn retain(&mut self, f: impl Fn(&V) -> bool) {
-        if let State::Incomplete { pending, verified } = &mut self.state {
+    fn retain(&mut self, f: impl Fn(&V) -> bool, weight: impl Fn(&V) -> u64) {
+        if let State::Incomplete {
+            pending,
+            pending_weight,
+            verified,
+            verified_weight,
+        } = &mut self.state
+        {
             pending.retain(|v| f(v));
             verified.retain(|v| f(v));
+            *pending_weight = pending.iter().map(&weight).sum();
+            *verified_weight = verified.iter().map(weight).sum();
         }
     }
 }
@@ -226,8 +289,8 @@ impl<D: Digest> ProposalState<D> {
 /// efficient batch verification. For schemes where `is_batchable()` returns `false` (such as [secp256r1]),
 /// signatures are verified eagerly as they arrive since there is no batching benefit.
 ///
-/// To avoid unnecessary verification, it also tracks the number of already verified messages (ensuring
-/// we no longer attempt to verify messages after a quorum of valid messages have already been verified).
+/// To avoid unnecessary verification, it also tracks the weight of already verified messages (ensuring
+/// we no longer attempt to verify messages after a quorum of valid weight has already been verified).
 ///
 /// Once polled, async verification moves the pending batch and accumulated verified votes into
 /// the worker. Do not cancel an in-flight verification unless the verifier will also be discarded.
@@ -268,22 +331,23 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
     ///
     /// * `round` - The round being certified.
     /// * `scheme` - Scheme handle used to verify and aggregate votes.
-    /// * `quorum` - Number of votes (2f+1) required to reach a quorum.
-    pub fn new(round: Rnd, scheme: impl Into<Arc<S>>, quorum: u32) -> Self {
-        // Hold quorum as usize to simplify comparisons against queue lengths.
-        let quorum = quorum as usize;
+    /// * `quorum_weight` - Vote weight (2f+1) required to reach a quorum.
+    pub fn new(round: Rnd, scheme: impl Into<Arc<S>>, quorum_weight: u64) -> Self {
+        let scheme = scheme.into();
+        let reservation_capacity = usize::try_from(scheme.participants().quorum_count::<N3f1>())
+            .expect("participant quorum must fit in usize");
         let batchable = S::is_batchable();
         Self {
-            scheme: scheme.into(),
+            scheme,
 
             round,
 
             leader: None,
             proposal: ProposalState::Unknown,
 
-            notarize: Certification::new(quorum, batchable),
-            nullify: Certification::new(quorum, batchable),
-            finalize: Certification::new(quorum, batchable),
+            notarize: Certification::new(quorum_weight, reservation_capacity, batchable),
+            nullify: Certification::new(quorum_weight, reservation_capacity, batchable),
+            finalize: Certification::new(quorum_weight, reservation_capacity, batchable),
         }
     }
 
@@ -417,8 +481,15 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                 replaced: false,
             };
         };
-        self.notarize.retain(|n| &n.proposal == proposal);
-        self.finalize.retain(|f| &f.proposal == proposal);
+        let participants = self.scheme.participants();
+        self.notarize.retain(
+            |n| &n.proposal == proposal,
+            |n| participants.weight(n.signer()).unwrap_or(0),
+        );
+        self.finalize.retain(
+            |f| &f.proposal == proposal,
+            |f| participants.weight(f.signer()).unwrap_or(0),
+        );
         ProposalUpdate {
             changed: true,
             replaced,
@@ -445,6 +516,11 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
     pub fn add(&mut self, msg: Vote<S, D>, verified: bool) {
         match msg {
             Vote::Notarize(notarize) => {
+                let weight = self
+                    .scheme
+                    .participants()
+                    .weight(notarize.signer())
+                    .unwrap_or(0);
                 self.try_set_proposal_from_leader(&notarize);
 
                 // If the proposal is known and the message is not for it, drop it
@@ -453,19 +529,29 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                 {
                     return;
                 }
-                self.notarize.add(notarize, verified);
+                self.notarize.add(notarize, weight, verified);
             }
             Vote::Nullify(nullify) => {
-                self.nullify.add(nullify, verified);
+                let weight = self
+                    .scheme
+                    .participants()
+                    .weight(nullify.signer())
+                    .unwrap_or(0);
+                self.nullify.add(nullify, weight, verified);
             }
             Vote::Finalize(finalize) => {
+                let weight = self
+                    .scheme
+                    .participants()
+                    .weight(finalize.signer())
+                    .unwrap_or(0);
                 // If the proposal is known and the message is not for it, drop it
                 if let Some(proposal) = self.proposal()
                     && proposal != &finalize.proposal
                 {
                     return;
                 }
-                self.finalize.add(finalize, verified);
+                self.finalize.add(finalize, weight, verified);
             }
         }
     }
@@ -552,7 +638,13 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                             attestation,
                         },
                     ));
-                    (verified_notarizes, invalid)
+                    let weight = verified_notarizes
+                        .iter()
+                        .map(|notarize| {
+                            scheme.participants().weight(notarize.signer()).unwrap_or(0)
+                        })
+                        .sum();
+                    (verified_notarizes, weight, invalid)
                 })
             })
             .await
@@ -601,7 +693,11 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                             .into_iter()
                             .map(|attestation| Nullify { round, attestation }),
                     );
-                    (verified_nullifies, invalid)
+                    let weight = verified_nullifies
+                        .iter()
+                        .map(|nullify| scheme.participants().weight(nullify.signer()).unwrap_or(0))
+                        .sum();
+                    (verified_nullifies, weight, invalid)
                 })
             })
             .await
@@ -664,7 +760,13 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                             attestation,
                         },
                     ));
-                    (verified_finalizes, invalid)
+                    let weight = verified_finalizes
+                        .iter()
+                        .map(|finalize| {
+                            scheme.participants().weight(finalize.signer()).unwrap_or(0)
+                        })
+                        .sum();
+                    (verified_finalizes, weight, invalid)
                 })
             })
             .await
@@ -689,21 +791,46 @@ mod tests {
     };
     use commonware_cryptography::{
         bls12381::primitives::variant::{MinPk, MinSig},
-        certificate::mocks::Fixture,
+        certificate::{Scheme as _, mocks::Fixture},
         ed25519::PublicKey,
         sha256::Digest as Sha256,
     };
     use commonware_macros::test_async;
     use commonware_parallel::Sequential;
-    use commonware_utils::{Faults, N3f1, TestRng, test_rng};
+    use commonware_utils::{Faults, N3f1, TestRng, ordered::Committee, test_rng};
 
     const NAMESPACE: &[u8] = b"test";
 
-    fn count_quorum(participants: usize) -> u32 {
-        u32::try_from(N3f1::quorum(
-            u64::try_from(participants).expect("participant count exceeds u64::MAX"),
-        ))
-        .expect("quorum for a u32-indexed participant set must fit in u32")
+    fn count_quorum(participants: usize) -> u64 {
+        N3f1::quorum(u64::try_from(participants).expect("participant count exceeds u64::MAX"))
+    }
+
+    fn weighted_ed25519(weights: &[u64]) -> Vec<ed25519::Scheme> {
+        let mut rng = test_rng();
+        let Fixture {
+            participants,
+            private_keys,
+            ..
+        } = ed25519::fixture(
+            &mut rng,
+            NAMESPACE,
+            u32::try_from(weights.len()).expect("test committee must fit in u32"),
+        );
+        let committee = Committee::try_from(
+            participants
+                .into_iter()
+                .zip(weights.iter().copied())
+                .collect::<Vec<_>>(),
+        )
+        .expect("test committee must be valid");
+
+        private_keys
+            .into_iter()
+            .map(|private_key| {
+                ed25519::Scheme::signer(NAMESPACE, committee.clone(), private_key)
+                    .expect("private key must belong to test committee")
+            })
+            .collect()
     }
 
     impl<V> Certification<V> {
@@ -726,9 +853,9 @@ mod tests {
         /// Returns the capacities of the pending and verified vote buffers.
         fn capacities(&self) -> (usize, usize) {
             match &self.state {
-                State::Incomplete { pending, verified } => {
-                    (pending.capacity(), verified.capacity())
-                }
+                State::Incomplete {
+                    pending, verified, ..
+                } => (pending.capacity(), verified.capacity()),
                 State::Complete => (0, 0),
             }
         }
@@ -763,20 +890,21 @@ mod tests {
     #[test_async]
     async fn test_non_batchable_certification_avoids_repeated_quorum_reservations() {
         let quorum = 64;
-        let mut certification = Certification::new(quorum, false);
-        certification.add(1u8, false);
+        let mut certification = Certification::new(quorum, quorum as usize, false);
+        certification.add(1u8, 1, false);
         certification
             .try_verify(|pending, mut verified| async move {
                 verified.extend(pending);
-                (verified, Vec::new())
+                let weight = verified.len() as u64;
+                (verified, weight, Vec::new())
             })
             .await
             .expect("non-batchable pending votes must verify eagerly");
 
-        certification.add(2u8, false);
+        certification.add(2u8, 1, false);
         let (pending, _) = certification.capacities();
         assert!(
-            pending < quorum,
+            pending < quorum as usize,
             "a single eagerly verified vote should not reserve a quorum-sized buffer"
         );
     }
@@ -784,24 +912,121 @@ mod tests {
     #[test_async]
     async fn test_batchable_certification_reserves_only_remaining_quorum() {
         let quorum = 64;
-        let mut certification = Certification::new(quorum, true);
+        let mut certification = Certification::new(quorum, quorum as usize, true);
         for vote in 0..quorum {
-            certification.add(vote, false);
+            certification.add(vote, 1, false);
         }
         certification
             .try_verify(|mut pending, _| async move {
                 pending.pop().expect("quorum batch must be non-empty");
-                (pending, Vec::new())
+                let weight = pending.len() as u64;
+                (pending, weight, Vec::new())
             })
             .await
             .expect("a quorum of pending votes must trigger batch verification");
 
-        certification.add(quorum, false);
+        certification.add(quorum, 1, false);
         let (pending, _) = certification.capacities();
         assert!(
-            pending < quorum,
+            pending < quorum as usize,
             "one replacement vote should not reserve a quorum-sized buffer"
         );
+    }
+
+    #[test_async]
+    async fn test_count_quorum_is_insufficient_without_quorum_weight() {
+        let schemes = weighted_ed25519(&[4, 1, 1, 1]);
+        let round = Round::new(Epoch::new(0), View::new(1));
+        let quorum_weight = schemes[0].participants().quorum_weight::<N3f1>();
+        let mut verifier =
+            Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone(), quorum_weight);
+
+        for scheme in schemes.iter().skip(1) {
+            verifier.add(Vote::Nullify(create_nullify(scheme, round)), true);
+        }
+
+        assert_eq!(verifier.nullify.verified().len(), 3);
+        assert!(
+            verifier
+                .try_construct_certificate(&Sequential)
+                .await
+                .is_none(),
+            "three signer-unique votes have count quorum but only weight three"
+        );
+    }
+
+    #[test_async]
+    async fn test_exact_weighted_boundary_verifies_and_completes() {
+        let schemes = weighted_ed25519(&[4, 1, 1, 1]);
+        let round = Round::new(Epoch::new(0), View::new(1));
+        let quorum_weight = schemes[0].participants().quorum_weight::<N3f1>();
+        assert_eq!(quorum_weight, 5);
+        let mut verifier =
+            Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone(), quorum_weight);
+
+        for scheme in schemes.iter().take(2) {
+            verifier.add(Vote::Nullify(create_nullify(scheme, round)), false);
+        }
+        assert!(verifier.nullify.should_verify());
+        let (_, invalid) = verifier
+            .try_verify_nullifies(&mut test_rng(), &Sequential)
+            .await
+            .expect("exact quorum weight must trigger verification");
+        assert!(invalid.is_empty());
+        assert!(
+            verifier
+                .try_construct_certificate(&Sequential)
+                .await
+                .is_some(),
+            "exact verified quorum weight must complete"
+        );
+    }
+
+    #[test_async]
+    async fn test_invalid_heavy_signature_does_not_complete_with_valid_lights() {
+        let schemes = weighted_ed25519(&[4, 1, 1, 1]);
+        let round = Round::new(Epoch::new(0), View::new(1));
+        let quorum_weight = schemes[0].participants().quorum_weight::<N3f1>();
+        let mut verifier =
+            Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone(), quorum_weight);
+
+        let mut invalid_heavy = create_nullify(&schemes[1], round);
+        invalid_heavy.attestation.signer = Participant::new(0);
+        verifier.add(Vote::Nullify(invalid_heavy), false);
+        for scheme in schemes.iter().skip(1) {
+            verifier.add(Vote::Nullify(create_nullify(scheme, round)), false);
+        }
+
+        assert!(verifier.nullify.should_verify());
+        let (_, invalid) = verifier
+            .try_verify_nullifies(&mut test_rng(), &Sequential)
+            .await
+            .expect("claimed pending weight reaches quorum");
+        assert_eq!(invalid, vec![Participant::new(0)]);
+        assert_eq!(verifier.nullify.verified().len(), 3);
+        assert!(
+            verifier
+                .try_construct_certificate(&Sequential)
+                .await
+                .is_none(),
+            "only the weight of valid signatures may complete certification"
+        );
+    }
+
+    #[test]
+    fn test_large_weights_do_not_increase_vote_buffer_capacity() {
+        let schemes = weighted_ed25519(&[1_000_000, 1, 1, 1]);
+        let round = Round::new(Epoch::new(0), View::new(1));
+        let quorum_weight = schemes[0].participants().quorum_weight::<N3f1>();
+        let mut verifier =
+            Verifier::<ed25519::Scheme, Sha256>::new(round, schemes[0].clone(), quorum_weight);
+
+        verifier.add(Vote::Nullify(create_nullify(&schemes[0], round)), false);
+        let (pending, verified) = verifier.nullify.capacities();
+        assert_eq!(verifier.nullify.reservation_capacity, 3);
+        assert!(pending >= verifier.nullify.reservation_capacity);
+        assert_eq!(verified, 0);
+        assert!(pending < quorum_weight as usize);
     }
 
     // Helper function to create a sample digest
@@ -1064,7 +1289,9 @@ mod tests {
         faulty_vote.attestation.signer = Participant::from_usize(schemes.len() + 10);
         verifier2.add(Vote::Notarize(faulty_vote.clone()), false);
 
-        for scheme in schemes.iter().skip(2).take(quorum as usize - 2) {
+        // The malformed out-of-range signer contributes no pending weight, so
+        // add a full quorum of valid signer weight alongside it.
+        for scheme in schemes.iter().skip(2).take(quorum as usize - 1) {
             verifier2.add(
                 Vote::Notarize(create_notarize(scheme, round2, View::new(1), 10)),
                 false,
@@ -1076,7 +1303,7 @@ mod tests {
             .try_verify_notarizes(&mut rng, &Sequential)
             .await
             .unwrap();
-        assert_eq!(batch, quorum as usize);
+        assert_eq!(batch, quorum as usize + 1);
         assert!(
             verifier2
                 .notarize
@@ -2185,22 +2412,22 @@ mod tests {
     #[test_async]
     async fn test_certification_lifecycle() {
         // Non-batchable schemes verify eagerly whenever votes are pending.
-        let mut eager = Certification::<u64>::new(3, false);
-        eager.add(1, false);
+        let mut eager = Certification::<u64>::new(3, 3, false);
+        eager.add(1, 1, false);
         assert!(eager.should_verify());
 
         // Certification owns the pending and verified buffer lifecycle; its
         // caller owns signer uniqueness. Opaque values keep this test focused
         // on that boundary.
-        let mut votes = Certification::<u64>::new(3, true);
-        votes.add(1, false);
-        votes.add(2, true);
+        let mut votes = Certification::<u64>::new(3, 3, true);
+        votes.add(1, 1, false);
+        votes.add(2, 1, true);
         assert_eq!(votes.pending(), &[1]);
         assert_eq!(votes.verified(), &[2]);
 
         // Batchable schemes wait until the buffers could reach quorum.
         assert!(!votes.should_verify());
-        votes.add(3, false);
+        votes.add(3, 1, false);
         assert!(votes.should_verify());
 
         // Verification consumes both buffers and stores the new verified set.
@@ -2209,7 +2436,7 @@ mod tests {
             .try_verify(|pending, verified| async move {
                 assert_eq!(pending, vec![1, 3]);
                 assert_eq!(verified, vec![2]);
-                (vec![1, 2], vec![])
+                (vec![1, 2], 2, vec![])
             })
             .await
             .unwrap();
@@ -2219,10 +2446,10 @@ mod tests {
         assert_eq!(votes.try_complete(), None);
 
         // At quorum, recovery completes the phase and consumes the votes.
-        votes.add(3, true);
+        votes.add(3, 1, true);
         assert_eq!(votes.try_complete(), Some(vec![1, 2, 3]));
         assert!(votes.is_complete());
-        votes.add(5, false);
+        votes.add(5, 1, false);
         assert!(votes.pending().is_empty());
         assert!(votes.verified().is_empty());
         assert!(
@@ -2237,8 +2464,8 @@ mod tests {
         assert!(votes.is_complete());
 
         // Network certificates complete without any votes.
-        let mut votes = Certification::<u64>::new(3, true);
-        votes.add(1, false);
+        let mut votes = Certification::<u64>::new(3, 3, true);
+        votes.add(1, 1, false);
         votes.complete();
         assert!(votes.is_complete());
         assert!(votes.pending().is_empty());

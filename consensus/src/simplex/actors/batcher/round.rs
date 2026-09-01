@@ -14,7 +14,7 @@ use crate::{
 use commonware_cryptography::Digest;
 use commonware_p2p::Blocker;
 use commonware_parallel::Strategy;
-use commonware_utils::{N3f1, ordered::Quorum};
+use commonware_utils::N3f1;
 use rand_core::CryptoRng;
 use std::sync::Arc;
 use tracing::Span;
@@ -63,7 +63,7 @@ impl<
         reporter: R,
         track_historical_votes: bool,
     ) -> Self {
-        let quorum = scheme.participants().quorum_count::<N3f1>();
+        let quorum = scheme.participants().quorum_weight::<N3f1>();
         let len = scheme.participants().len();
         Self {
             blocker,
