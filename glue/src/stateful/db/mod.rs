@@ -8,9 +8,9 @@
 //! Normal execution has three stages:
 //! 1. [`Unmerkleized`]: mutable, in-progress batch (concrete types expose reads and writes).
 //! 2. [`Merkleized`]: a sealed batch with a computed root.
-//! 3. Finalization applies the sealed batch via [`ManagedDb::apply`]. The application establishes
-//!    its finalized handoff before persistence starts via [`ManagedDb::finalize`]. Durability is
-//!    observed via [`Barrier`].
+//! 3. Finalization applies the sealed batch via [`ManagedDb::apply`]. It then requests durability
+//!    via [`ManagedDb::finalize`] and observes completion through [`Barrier`]. A barrier covers the
+//!    state applied before it was requested. Later batches may reach storage while it is pending.
 //!
 //! [`DatabaseSet`] groups one or more [`ManagedDb`] instances into one logical
 //! unit for execution and commit.
@@ -193,7 +193,8 @@ impl<DB> Shared<DB> {
 /// Unlike [`Shared`], this handle cannot acquire a write slot, construct or
 /// apply batches, finalize database state, prune, or rewind. Applications
 /// receive readers in
-/// [`Application::finalized`](super::Application::finalized) so observing
+/// [`Application::capture_finalized`](super::Application::capture_finalized)
+/// and [`Application::finalized`](super::Application::finalized) so observing
 /// finalized state cannot invalidate concurrent speculative batches.
 ///
 /// ```compile_fail

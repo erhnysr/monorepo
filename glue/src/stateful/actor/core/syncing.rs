@@ -343,8 +343,8 @@ where
                     acknowledgement.acknowledge();
                 }
                 FinalizedHandoff::Apply(block, acknowledgement) => {
-                    let Applied { prune } = processor
-                        .finalize(self.context.as_present(), block.as_ref())
+                    let Applied { prune, .. } = processor
+                        .finalize(self.context.as_present(), block.as_ref(), false)
                         .await
                         .expect("sync handoff block cannot be a duplicate");
                     pending_acknowledgements.push(acknowledgement);
