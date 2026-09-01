@@ -149,8 +149,9 @@ impl<V> Certification<V> {
     /// [Self::should_verify]).
     ///
     /// `f` receives the pending and previously verified votes and returns the
-    /// new verified set plus the signers that failed verification. Returns
-    /// the number of votes processed alongside those signers.
+    /// combined verified set, the weight added by this batch, and the signers
+    /// that failed verification. Returns the number of votes processed
+    /// alongside those signers.
     async fn try_verify<F, Fut>(&mut self, f: F) -> Option<(usize, Vec<Participant>)>
     where
         F: FnOnce(Vec<V>, Vec<V>) -> Fut,
@@ -170,9 +171,9 @@ impl<V> Certification<V> {
         };
         let batch = pending.len();
         let (pending, prior) = (mem::take(pending), mem::take(verified));
+        let prior_weight = mem::take(verified_weight);
         *pending_weight = 0;
-        *verified_weight = 0;
-        let (votes, weight, invalid) = f(pending, prior).await;
+        let (votes, added_weight, invalid) = f(pending, prior).await;
         let State::Incomplete {
             verified,
             verified_weight,
@@ -182,7 +183,9 @@ impl<V> Certification<V> {
             unreachable!("certification completed mid-verification");
         };
         *verified = votes;
-        *verified_weight = weight;
+        *verified_weight = prior_weight
+            .checked_add(added_weight)
+            .expect("signer-unique vote weight cannot exceed committee weight");
         Some((batch, invalid))
     }
 
@@ -632,19 +635,22 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                         &strategy,
                     );
 
+                    let added_weight = verified
+                        .iter()
+                        .map(|attestation| {
+                            scheme
+                                .participants()
+                                .weight(attestation.signer)
+                                .unwrap_or(0)
+                        })
+                        .sum();
                     verified_notarizes.extend(verified.into_iter().zip(proposals).map(
                         |(attestation, proposal)| Notarize {
                             proposal,
                             attestation,
                         },
                     ));
-                    let weight = verified_notarizes
-                        .iter()
-                        .map(|notarize| {
-                            scheme.participants().weight(notarize.signer()).unwrap_or(0)
-                        })
-                        .sum();
-                    (verified_notarizes, weight, invalid)
+                    (verified_notarizes, added_weight, invalid)
                 })
             })
             .await
@@ -688,16 +694,21 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                         &strategy,
                     );
 
+                    let added_weight = verified
+                        .iter()
+                        .map(|attestation| {
+                            scheme
+                                .participants()
+                                .weight(attestation.signer)
+                                .unwrap_or(0)
+                        })
+                        .sum();
                     verified_nullifies.extend(
                         verified
                             .into_iter()
                             .map(|attestation| Nullify { round, attestation }),
                     );
-                    let weight = verified_nullifies
-                        .iter()
-                        .map(|nullify| scheme.participants().weight(nullify.signer()).unwrap_or(0))
-                        .sum();
-                    (verified_nullifies, weight, invalid)
+                    (verified_nullifies, added_weight, invalid)
                 })
             })
             .await
@@ -754,19 +765,22 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                         &strategy,
                     );
 
+                    let added_weight = verified
+                        .iter()
+                        .map(|attestation| {
+                            scheme
+                                .participants()
+                                .weight(attestation.signer)
+                                .unwrap_or(0)
+                        })
+                        .sum();
                     verified_finalizes.extend(verified.into_iter().zip(proposals).map(
                         |(attestation, proposal)| Finalize {
                             proposal,
                             attestation,
                         },
                     ));
-                    let weight = verified_finalizes
-                        .iter()
-                        .map(|finalize| {
-                            scheme.participants().weight(finalize.signer()).unwrap_or(0)
-                        })
-                        .sum();
-                    (verified_finalizes, weight, invalid)
+                    (verified_finalizes, added_weight, invalid)
                 })
             })
             .await
@@ -859,6 +873,18 @@ mod tests {
                 State::Complete => (0, 0),
             }
         }
+
+        /// Returns the pending and verified vote weights.
+        fn weights(&self) -> (u64, u64) {
+            match &self.state {
+                State::Incomplete {
+                    pending_weight,
+                    verified_weight,
+                    ..
+                } => (*pending_weight, *verified_weight),
+                State::Complete => (0, 0),
+            }
+        }
     }
 
     /// A round reserves vote storage only for phases that receive votes.
@@ -894,9 +920,9 @@ mod tests {
         certification.add(1u8, 1, false);
         certification
             .try_verify(|pending, mut verified| async move {
+                let added_weight = pending.len() as u64;
                 verified.extend(pending);
-                let weight = verified.len() as u64;
-                (verified, weight, Vec::new())
+                (verified, added_weight, Vec::new())
             })
             .await
             .expect("non-batchable pending votes must verify eagerly");
@@ -907,6 +933,16 @@ mod tests {
             pending < quorum as usize,
             "a single eagerly verified vote should not reserve a quorum-sized buffer"
         );
+        certification
+            .try_verify(|pending, mut verified| async move {
+                assert_eq!(pending, vec![2]);
+                assert_eq!(verified, vec![1]);
+                verified.extend(pending);
+                (verified, 1, Vec::new())
+            })
+            .await
+            .expect("the next non-batchable vote must verify eagerly");
+        assert_eq!(certification.weights(), (0, 2));
     }
 
     #[test_async]
@@ -2436,7 +2472,7 @@ mod tests {
             .try_verify(|pending, verified| async move {
                 assert_eq!(pending, vec![1, 3]);
                 assert_eq!(verified, vec![2]);
-                (vec![1, 2], 2, vec![])
+                (vec![1, 2], 1, vec![])
             })
             .await
             .unwrap();

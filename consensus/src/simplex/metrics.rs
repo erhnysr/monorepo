@@ -1,3 +1,4 @@
+use crate::types::Epoch;
 use commonware_cryptography::PublicKey;
 use commonware_runtime::{
     Metrics as RuntimeMetrics,
@@ -37,30 +38,31 @@ pub(crate) struct Committee {
 
 impl Committee {
     /// Registers metrics for an epoch's committee profile.
-    pub(crate) fn init(context: &impl RuntimeMetrics, profile: Profile) -> Self {
+    pub(crate) fn init(context: &impl RuntimeMetrics, epoch: Epoch, profile: Profile) -> Self {
+        let context = context.child("committee").with_attribute("epoch", epoch);
         Self {
             _total_weight: context.register(
-                "committee_total_weight",
+                "total_weight",
                 "Total weight of the committee",
                 ImmutableGauge(profile.total_weight),
             ),
             _max_fault_weight: context.register(
-                "committee_max_fault_weight",
+                "max_fault_weight",
                 "Maximum faulty weight tolerated by the committee",
                 ImmutableGauge(profile.max_fault_weight),
             ),
             _quorum_weight: context.register(
-                "committee_quorum_weight",
+                "quorum_weight",
                 "Weight required for a committee quorum",
                 ImmutableGauge(profile.quorum_weight),
             ),
             _max_participant_weight: context.register(
-                "committee_max_participant_weight",
+                "max_participant_weight",
                 "Maximum weight of one committee participant",
                 ImmutableGauge(profile.max_weight),
             ),
             _minimum_quorum_cardinality: context.register(
-                "committee_minimum_quorum_cardinality",
+                "minimum_quorum_cardinality",
                 "Minimum number of participants required to reach committee quorum",
                 ImmutableGauge(profile.minimum_quorum_cardinality.into()),
             ),
@@ -250,7 +252,7 @@ mod tests {
                 max_weight: total_weight - 4,
                 minimum_quorum_cardinality: 2,
             };
-            let _metrics = Committee::init(&context, profile);
+            let _metrics = Committee::init(&context, Epoch::new(7), profile);
             let encoded = context.encode();
 
             for (name, value) in [
@@ -260,12 +262,32 @@ mod tests {
                 ("committee_max_participant_weight", total_weight - 4),
                 ("committee_minimum_quorum_cardinality", 2),
             ] {
-                let expected = format!("{name} {value}");
+                let expected = format!("{name}{{epoch=\"7\"}} {value}");
                 assert!(
                     encoded.lines().any(|line| line == expected),
                     "missing {name}={value} in:\n{encoded}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn committee_profiles_are_scoped_by_epoch() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let profile = |total_weight| Profile {
+                total_weight,
+                max_fault_weight: 1,
+                quorum_weight: total_weight - 1,
+                max_weight: total_weight - 2,
+                minimum_quorum_cardinality: 2,
+            };
+            let _first = Committee::init(&context, Epoch::new(1), profile(10));
+            let _second = Committee::init(&context, Epoch::new(2), profile(20));
+            let encoded = context.encode();
+
+            assert!(encoded.contains("committee_total_weight{epoch=\"1\"} 10"));
+            assert!(encoded.contains("committee_total_weight{epoch=\"2\"} 20"));
         });
     }
 }

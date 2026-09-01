@@ -160,7 +160,7 @@ impl<
                 "participant weight reaches quorum",
             );
         }
-        let committee_metrics = metrics::Committee::init(&context, profile);
+        let committee_metrics = metrics::Committee::init(&context, cfg.epoch, profile);
 
         // Return the engine
         Self {
