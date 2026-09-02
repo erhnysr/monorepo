@@ -86,7 +86,7 @@ where
     where
         S: SimplexScheme<Self::Commitment>,
     {
-        coding_config_for_committee(scheme.participants())
+        coding_config_for_committee::<C, _>(scheme.participants())
             .is_some_and(|config| payload.config() == config)
     }
 
@@ -310,7 +310,9 @@ mod tests {
         type TestVariant = Coding<NoCloneBlock, TestScheme, Sha256, PublicKey>;
 
         let block = no_clone_block(CONFIG);
-        let coded = CodedBlock::<NoCloneBlock, TestScheme, Sha256>::new(block, CONFIG, &Sequential);
+        let coded =
+            CodedBlock::<NoCloneBlock, TestScheme, Sha256>::try_new(block, CONFIG, &Sequential)
+                .unwrap();
         let expected = coded.commitment();
         let stored = StoredCodedBlock::new(coded);
 

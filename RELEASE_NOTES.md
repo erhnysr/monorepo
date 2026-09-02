@@ -9,10 +9,14 @@ BLS multisig certificates form and verify quorum by weight. BLS threshold
 schemes remain count-based and reject non-uniform committees. Certificate
 encoding is unchanged ([#4635]).
 
-### Coding Marshal Committee Guards
+### Weighted Coding Committees
 
-The coding marshal declines proposals and rejects payloads when a committee is
-non-uniform or has a participant count outside `4..=u16::MAX` ([#4651]).
+The coding marshal now derives its minimum shard count from committee weights
+and rejects participant counts outside `4..=u16::MAX` or configurations that
+the coding scheme cannot support. This replaces the temporary non-uniform
+committee guard and changes coding commitments for uniform committees whose
+size is not `3f + 1`, requiring a coordinated, drained upgrade ([#4651],
+[#4652]).
 
 ### Crash Recovery
 
@@ -39,6 +43,7 @@ after restart ([#4420]).
 [#4420]: https://github.com/commonwarexyz/monorepo/pull/4420
 [#4635]: https://github.com/commonwarexyz/monorepo/pull/4635
 [#4651]: https://github.com/commonwarexyz/monorepo/pull/4651
+[#4652]: https://github.com/commonwarexyz/monorepo/pull/4652
 
 ## v2026.7.0
 

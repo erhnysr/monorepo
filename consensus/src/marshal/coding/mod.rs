@@ -5,8 +5,10 @@
 //! The coding marshal couples the consensus pipeline with erasure-coded block broadcast.
 //! Blocks are produced by an application, encoded into [`types::Shard`]s, fanned out to peers, and
 //! later reconstructed when a notarization or finalization proves that the data is needed.
-//! The coding marshal supports uniform committees with `4..=u16::MAX` participants. For other
-//! committees, it declines to propose and rejects every payload.
+//! The coding marshal supports committees with `4..=u16::MAX` participants when the coding scheme
+//! accepts the derived shard configuration. The minimum shard count is the fewest heaviest
+//! participants whose combined weight reaches the honest portion of a quorum. For unsupported
+//! committees, the marshal declines to propose and rejects every payload.
 //! Compared to [`super::standard`], this variant makes more efficient usage of the network's bandwidth
 //! by spreading the load of block dissemination across all participants.
 //!
@@ -71,7 +73,11 @@ mod tests {
             ancestry::BlockProvider,
             coding::{
                 Coding, Marshaled, MarshaledConfig, shards,
-                types::{CodedBlock, coding_config_for_participants, hash_context},
+                types::{
+                    CodedBlock, coding_config_for_committee, coding_config_for_participants,
+                    hash_context,
+                },
+                validation::validate_proposal,
             },
             config::{Config, Start},
             core,
@@ -102,7 +108,7 @@ mod tests {
     use commonware_coding::{CodecConfig, Config as CodingConfig, ReedSolomon};
     use commonware_cryptography::{
         Committable, Digestible, Hasher,
-        certificate::{ConstantProvider, Verifier as _, mocks::Fixture},
+        certificate::{ConstantProvider, Scheme as _, Verifier as _, mocks::Fixture},
         sha256::Sha256,
     };
     use commonware_macros::{select, test_group, test_traced};
@@ -1069,6 +1075,11 @@ mod tests {
     #[test_traced("WARN")]
     fn test_coding_delivery_visibility_implies_recoverable_after_restart() {
         harness::delivery_visibility_implies_recoverable_after_restart::<CodingHarness>(0..16);
+    }
+
+    #[test]
+    fn test_drained_weighted_upgrade_retains_finalized_config() {
+        harness::drained_weighted_upgrade_retains_finalized_config();
     }
 
     #[test_traced("WARN")]
@@ -3459,7 +3470,7 @@ mod tests {
     }
 
     #[test]
-    fn test_coding_check_payload_rejects_non_uniform_committee() {
+    fn test_coding_payload_and_reproposal_use_weighted_config() {
         let runner = deterministic::Runner::default();
         runner.start(|mut context| async move {
             let fixture = simplex_ed25519::fixture(&mut context, NAMESPACE, NUM_VALIDATORS);
@@ -3467,14 +3478,32 @@ mod tests {
                 .participants
                 .iter()
                 .cloned()
-                .zip([1, 1, 1, 2])
+                .zip([4, 1, 1, 1])
                 .try_collect::<Committee<_>>()
                 .unwrap();
             let scheme = simplex_ed25519::Scheme::verifier(NAMESPACE, committee);
+            let config = coding_config_for_committee::<ReedSolomon<Sha256>, _>(
+                scheme.participants(),
+            )
+            .unwrap();
+            let genesis = genesis_commitment();
+            let weighted = Commitment::from((
+                genesis.block(),
+                genesis.root(),
+                genesis.context(),
+                config,
+            ));
 
-            assert!(!<TestCodingVariant as core::Variant>::check_payload(
+            assert!(<TestCodingVariant as core::Variant>::check_payload(
                 &scheme,
-                genesis_commitment()
+                weighted
+            ));
+            assert_eq!(
+                validate_proposal(weighted, config, None::<&CodingCtx>),
+                Ok(())
+            );
+            assert!(!<TestCodingVariant as core::Variant>::check_payload(
+                &scheme, genesis
             ));
         });
     }

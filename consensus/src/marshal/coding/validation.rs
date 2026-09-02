@@ -151,7 +151,7 @@ mod tests {
     use commonware_cryptography::{
         Committable, Digestible, Hasher, Sha256, sha256::Digest as Sha256Digest,
     };
-    use commonware_utils::NZU64;
+    use commonware_utils::{NZU16, NZU64};
 
     type TestCommitment = Commitment<TestBlock, ReedSolomon<Sha256>, Sha256>;
 
@@ -478,6 +478,30 @@ mod tests {
         let wrong = coding_config_for_participants(7);
         assert_eq!(
             validate_proposal(fixture.commitment, wrong, Some(&fixture.context)),
+            Err(ProposalError::CodingConfig)
+        );
+    }
+
+    #[test]
+    fn test_validate_proposal_uses_derived_k() {
+        let fixture = baseline_fixture();
+        let weighted_config = CodingConfig {
+            minimum_shards: NZU16!(1),
+            extra_shards: NZU16!(3),
+        };
+        let commitment = commitment_for(
+            fixture.block.digest(),
+            fixture.context,
+            weighted_config,
+            b"weighted_root",
+        );
+
+        assert_eq!(
+            validate_proposal(commitment, weighted_config, Some(&fixture.context)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_proposal(commitment, fixture.config, Some(&fixture.context)),
             Err(ProposalError::CodingConfig)
         );
     }

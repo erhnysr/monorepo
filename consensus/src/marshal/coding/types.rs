@@ -11,6 +11,7 @@ use commonware_parallel::{Sequential, Strategy};
 use commonware_utils::{Faults, N3f1, NZU16, ordered::Committee};
 use std::{
     marker::PhantomData,
+    num::NonZeroU16,
     sync::{Arc, OnceLock},
 };
 
@@ -153,30 +154,42 @@ pub struct CodedBlock<B: Block, C: Scheme, H: Hasher> {
     _hasher: PhantomData<H>,
 }
 
+type Encoding<C> = (<C as Scheme>::Commitment, Vec<<C as Scheme>::Shard>);
+
 impl<B: Block, C: Scheme, H: Hasher> CodedBlock<B, C, H> {
     /// Erasure codes the block.
     fn encode(
         inner: &B,
         config: CodingConfig,
         strategy: &impl Strategy,
-    ) -> (C::Commitment, Vec<C::Shard>) {
+    ) -> Result<Encoding<C>, C::Error> {
         let mut buf = Vec::with_capacity(inner.encode_size() + config.encode_size());
         inner.write(&mut buf);
         config.write(&mut buf);
 
-        C::encode(&config, buf.as_slice(), strategy).expect("must encode block successfully")
+        C::encode(&config, buf.as_slice(), strategy)
     }
 
-    /// Create a new [`CodedBlock`] from a [`Block`] and a configuration.
-    pub fn new(inner: B, config: CodingConfig, strategy: &impl Strategy) -> Self {
-        let (commitment, shards) = Self::encode(&inner, config, strategy);
-        Self {
+    /// Creates a new [`CodedBlock`] from a [`Block`] and a configuration.
+    pub fn try_new(
+        inner: B,
+        config: CodingConfig,
+        strategy: &impl Strategy,
+    ) -> Result<Self, C::Error> {
+        let (commitment, shards) = Self::encode(&inner, config, strategy)?;
+        Ok(Self {
             inner: Arc::new(inner),
             config,
             commitment,
             shards: OnceLock::from(Arc::<[C::Shard]>::from(shards)),
             _hasher: PhantomData,
-        }
+        })
+    }
+
+    /// Creates a new [`CodedBlock`] for tests.
+    #[cfg(any(test, feature = "mocks"))]
+    pub fn new(inner: B, config: CodingConfig, strategy: &impl Strategy) -> Self {
+        Self::try_new(inner, config, strategy).expect("test block must encode")
     }
 
     /// Create a new [`CodedBlock`] from a [`Block`] and trusted [`Commitment`].
@@ -204,7 +217,8 @@ impl<B: Block, C: Scheme, H: Hasher> CodedBlock<B, C, H> {
     /// If the shards have not yet been generated, they will be created via [`Scheme::encode`].
     pub fn shards(&self, strategy: &impl Strategy) -> &[C::Shard] {
         self.shards.get_or_init(|| {
-            let (commitment, shards) = Self::encode(&self.inner, self.config, strategy);
+            let (commitment, shards) = Self::encode(&self.inner, self.config, strategy)
+                .expect("trusted coded block must remain encodable");
 
             assert_eq!(
                 commitment, self.commitment,
@@ -556,7 +570,10 @@ impl<B: Block + PartialEq, C: Scheme, H: Hasher> PartialEq for StoredCodedBlock<
 
 impl<B: Block + Eq, C: Scheme, H: Hasher> Eq for StoredCodedBlock<B, C, H> {}
 
-/// Compute the [`CodingConfig`] for a given number of participants.
+/// Computes the [`CodingConfig`] for a unit-weight participant set.
+///
+/// Production code should use [`coding_config_for_committee`] so fault rounding uses the
+/// committee's actual total weight.
 ///
 /// Panics if `n_participants < 4`.
 pub fn coding_config_for_participants(n_participants: u16) -> CodingConfig {
@@ -566,23 +583,50 @@ pub fn coding_config_for_participants(n_participants: u16) -> CodingConfig {
         "Need at least 4 participants to maintain fault tolerance"
     );
     let max_faults = u16::try_from(max_faults).expect("max_faults must fit in u16");
-    let minimum_shards = NZU16!(max_faults + 1);
+    let minimum_shards = NZU16!(n_participants - 2 * max_faults);
     CodingConfig {
         minimum_shards,
         extra_shards: NZU16!(n_participants - minimum_shards.get()),
     }
 }
 
-/// Computes the [`CodingConfig`] for a committee supported by the coding marshal.
+/// Computes the [`CodingConfig`] for a committee supported by `C`.
 ///
-/// Returns `None` for non-uniform committees or participant counts outside
-/// `4..=u16::MAX`.
-pub fn coding_config_for_committee<P: Ord>(committee: &Committee<P>) -> Option<CodingConfig> {
-    if !committee.is_uniform() {
+/// Returns `None` when the participant count is outside `4..=u16::MAX` or the
+/// derived configuration is unsupported by `C`.
+pub fn coding_config_for_committee<C: Scheme, P: Ord>(
+    committee: &Committee<P>,
+) -> Option<CodingConfig> {
+    let n_participants = u16::try_from(committee.len()).ok()?;
+    if n_participants < 4 {
         return None;
     }
-    let n_participants = u16::try_from(committee.len()).ok()?;
-    (n_participants >= 4).then(|| coding_config_for_participants(n_participants))
+
+    let target = committee
+        .quorum_weight::<N3f1>()
+        .checked_sub(committee.max_fault_weight::<N3f1>())?;
+    let mut weights = committee.weights().to_vec();
+    weights.sort_unstable_by(|left, right| right.cmp(left));
+
+    let mut accumulated = 0u64;
+    let mut minimum_shards = 0u16;
+    for weight in weights {
+        accumulated = accumulated.checked_add(weight)?;
+        minimum_shards = minimum_shards.checked_add(1)?;
+        if accumulated >= target {
+            break;
+        }
+    }
+    if accumulated < target {
+        return None;
+    }
+
+    let config = CodingConfig {
+        minimum_shards: NonZeroU16::new(minimum_shards)?,
+        extra_shards: NonZeroU16::new(n_participants.checked_sub(minimum_shards)?)?,
+    };
+    C::validate_config(&config).ok()?;
+    Some(config)
 }
 
 #[cfg(test)]
@@ -648,44 +692,142 @@ mod test {
     }
 
     #[test]
-    fn test_coding_config_for_committee_rejects_unsupported_committees() {
+    fn test_coding_config_for_committee_rejects_unsupported_sizes() {
         let too_small = (0..3u32)
             .map(|participant| (participant, 1))
             .try_collect::<Committee<_>>()
             .unwrap();
-        assert_eq!(coding_config_for_committee(&too_small), None);
-
-        let non_uniform = [(0u32, 1), (1, 1), (2, 1), (3, 2)]
-            .into_iter()
-            .try_collect::<Committee<_>>()
-            .unwrap();
-        assert_eq!(coding_config_for_committee(&non_uniform), None);
+        assert_eq!(coding_config_for_committee::<RS, _>(&too_small), None);
 
         let too_large = (0..=u32::from(u16::MAX))
             .map(|participant| (participant, 1))
             .try_collect::<Committee<_>>()
             .unwrap();
-        assert_eq!(coding_config_for_committee(&too_large), None);
+        assert_eq!(coding_config_for_committee::<RS, _>(&too_large), None);
     }
 
     #[test]
-    fn test_coding_config_for_committee_accepts_uniform_boundaries() {
-        let minimum = (0..4u32)
-            .map(|participant| (participant, 7))
+    fn test_coding_config_for_committee_preserves_unit_weight_equivalence() {
+        for n in [4u16, 7, 10] {
+            let committee = (0..u32::from(n))
+                .map(|participant| (participant, 1))
+                .try_collect::<Committee<_>>()
+                .unwrap();
+            assert_eq!(
+                coding_config_for_committee::<RS, _>(&committee),
+                Some(coding_config_for_participants(n))
+            );
+        }
+
+        for (n, minimum_shards) in [(5u16, 3u16), (8, 4)] {
+            let committee = (0..u32::from(n))
+                .map(|participant| (participant, 1))
+                .try_collect::<Committee<_>>()
+                .unwrap();
+            let config = coding_config_for_committee::<RS, _>(&committee).unwrap();
+            assert_eq!(config.minimum_shards.get(), minimum_shards);
+            assert_eq!(config.extra_shards.get(), n - minimum_shards);
+        }
+    }
+
+    #[test]
+    fn test_coding_config_for_committee_uses_weight() {
+        let dominant = [(0u32, 7), (1, 1), (2, 1), (3, 1)]
+            .into_iter()
             .try_collect::<Committee<_>>()
             .unwrap();
         assert_eq!(
-            coding_config_for_committee(&minimum),
-            Some(coding_config_for_participants(4))
+            coding_config_for_committee::<RS, _>(&dominant),
+            Some(CodingConfig {
+                minimum_shards: NZU16!(1),
+                extra_shards: NZU16!(3),
+            })
         );
 
-        let maximum = (0..u32::from(u16::MAX))
+        let same_k = [(0u32, 6), (1, 2), (2, 1), (3, 1)]
+            .into_iter()
+            .try_collect::<Committee<_>>()
+            .unwrap();
+        assert_eq!(
+            coding_config_for_committee::<RS, _>(&same_k),
+            coding_config_for_committee::<RS, _>(&dominant)
+        );
+
+        let two_required = [(0u32, 2), (1, 1), (2, 1), (3, 1)]
+            .into_iter()
+            .try_collect::<Committee<_>>()
+            .unwrap();
+        let same_two_required = [(0u32, 2), (1, 2), (2, 1), (3, 1)]
+            .into_iter()
+            .try_collect::<Committee<_>>()
+            .unwrap();
+        assert_eq!(
+            coding_config_for_committee::<RS, _>(&two_required),
+            coding_config_for_committee::<RS, _>(&same_two_required)
+        );
+        assert_eq!(
+            coding_config_for_committee::<RS, _>(&two_required)
+                .unwrap()
+                .minimum_shards,
+            NZU16!(2)
+        );
+    }
+
+    #[test]
+    fn test_coding_config_for_committee_matches_subset_oracle() {
+        for n in 4usize..=6 {
+            for encoded in 0..3usize.pow(u32::try_from(n).unwrap()) {
+                let mut remaining = encoded;
+                let weights = (0..n)
+                    .map(|participant| {
+                        let weight = u64::try_from(remaining % 3 + 1).unwrap();
+                        remaining /= 3;
+                        (u32::try_from(participant).unwrap(), weight)
+                    })
+                    .collect::<Vec<_>>();
+                let committee = weights
+                    .iter()
+                    .copied()
+                    .try_collect::<Committee<_>>()
+                    .unwrap();
+                let target = committee.quorum_weight::<N3f1>()
+                    - committee.max_fault_weight::<N3f1>();
+                let oracle = (1usize..1usize << n)
+                    .filter_map(|subset| {
+                        let weight = weights
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| subset & (1 << index) != 0)
+                            .map(|(_, (_, weight))| weight)
+                            .sum::<u64>();
+                        (weight >= target).then(|| subset.count_ones())
+                    })
+                    .min()
+                    .unwrap();
+
+                let config = coding_config_for_committee::<RS, _>(&committee).unwrap();
+                assert_eq!(u32::from(config.minimum_shards.get()), oracle);
+            }
+        }
+    }
+
+    #[test]
+    fn test_coding_config_for_committee_checks_reed_solomon_rate() {
+        let maximum_supported = (0..49_155u32)
+            .map(|participant| (participant, 1))
+            .try_collect::<Committee<_>>()
+            .unwrap();
+        let config = coding_config_for_committee::<RS, _>(&maximum_supported).unwrap();
+        assert_eq!(config.minimum_shards.get(), 16_387);
+        assert_eq!(config.extra_shards.get(), 32_768);
+
+        let first_unsupported = (0..49_156u32)
             .map(|participant| (participant, 1))
             .try_collect::<Committee<_>>()
             .unwrap();
         assert_eq!(
-            coding_config_for_committee(&maximum),
-            Some(coding_config_for_participants(u16::MAX))
+            coding_config_for_committee::<RS, _>(&first_unsupported),
+            None
         );
     }
 
@@ -716,7 +858,8 @@ mod test {
         };
 
         let block = TestBlock::new(Sha256::hash(&[b"parent"]), Height::new(42), 1_234_567);
-        let coded_block = CodedBlock::<TestBlock, RS, H>::new(block, CONFIG, &Sequential);
+        let coded_block =
+            CodedBlock::<TestBlock, RS, H>::try_new(block, CONFIG, &Sequential).unwrap();
 
         let encoded = coded_block.encode();
         let decoded = CodedBlock::<TestBlock, RS, H>::decode_cfg(
@@ -744,7 +887,8 @@ mod test {
 
         let block = TestBlock::new(Sha256::hash(&[b"parent"]), Height::new(42), 1_234_567);
         let expected =
-            CodedBlock::<TestBlock, RS, H>::new(block.clone(), EXPECTED_CONFIG, &Sequential)
+            CodedBlock::<TestBlock, RS, H>::try_new(block.clone(), EXPECTED_CONFIG, &Sequential)
+                .unwrap()
                 .commitment();
         let encoded = (block, EMBEDDED_CONFIG).encode();
 
@@ -773,7 +917,7 @@ mod test {
 
         // Build an expected commitment that differs only in its coding root.
         let block = TestBlock::new(Sha256::hash(&[b"parent"]), Height::new(42), 1_234_567);
-        let coded = CodedBlock::<TestBlock, RS, H>::new(block, CONFIG, &Sequential);
+        let coded = CodedBlock::<TestBlock, RS, H>::try_new(block, CONFIG, &Sequential).unwrap();
         let commitment = coded.commitment();
         let wrong_root = Sha256::hash(&[b"wrong root"]);
         assert_ne!(wrong_root, commitment.root());
@@ -810,7 +954,8 @@ mod test {
         };
 
         let block = TestBlock::new(Sha256::hash(&[b"parent"]), Height::new(42), 1_234_567);
-        let coded_block = CodedBlock::<TestBlock, RS, H>::new(block, CONFIG, &Sequential);
+        let coded_block =
+            CodedBlock::<TestBlock, RS, H>::try_new(block, CONFIG, &Sequential).unwrap();
         let cloned = coded_block.clone();
 
         assert!(Arc::ptr_eq(&coded_block.inner, &cloned.inner));
@@ -828,7 +973,8 @@ mod test {
         };
 
         let block = TestBlock::new(Sha256::hash(&[b"parent"]), Height::new(42), 1_234_567);
-        let coded_block = CodedBlock::<TestBlock, RS, H>::new(block, CONFIG, &Sequential);
+        let coded_block =
+            CodedBlock::<TestBlock, RS, H>::try_new(block, CONFIG, &Sequential).unwrap();
         let stored = StoredCodedBlock::<TestBlock, RS, H>::new(coded_block.clone());
 
         assert_eq!(stored.commitment(), coded_block.commitment());
@@ -852,7 +998,8 @@ mod test {
         };
 
         let block = TestBlock::new(Sha256::hash(&[b"parent"]), Height::new(42), 1_234_567);
-        let coded_block = CodedBlock::<TestBlock, RS, H>::new(block, CONFIG, &Sequential);
+        let coded_block =
+            CodedBlock::<TestBlock, RS, H>::try_new(block, CONFIG, &Sequential).unwrap();
         let original_commitment = coded_block.commitment();
         let original_digest = coded_block.digest();
 
@@ -873,7 +1020,8 @@ mod test {
         };
 
         let block = TestBlock::new(Sha256::hash(&[b"parent"]), Height::new(42), 1_234_567);
-        let coded_block = CodedBlock::<TestBlock, RS, H>::new(block, CONFIG, &Sequential);
+        let coded_block =
+            CodedBlock::<TestBlock, RS, H>::try_new(block, CONFIG, &Sequential).unwrap();
         let stored = StoredCodedBlock::<TestBlock, RS, H>::new(coded_block);
 
         let mut encoded = stored.encode().to_vec();

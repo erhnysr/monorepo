@@ -699,11 +699,11 @@ where
         };
 
         let committee = scheme.participants();
-        let Some(coding_config) = coding_config_for_committee(committee) else {
+        let Some(coding_config) = coding_config_for_committee::<C, _>(committee) else {
             warn!(
                 round = %consensus_context.round,
                 participants = committee.len(),
-                uniform = committee.is_uniform(),
+                total_weight = committee.total_weight(),
                 "coding does not support the epoch committee"
             );
             let (_, rx) = oneshot::channel();
@@ -865,7 +865,21 @@ where
                 build_timer.observe(&runtime_context);
 
                 let erasure_timer = erasure_encode_duration.timer(&runtime_context);
-                let coded_block = CodedBlock::<B, C, H>::new(built_block, coding_config, &strategy);
+                let coded_block = match CodedBlock::<B, C, H>::try_new(
+                    built_block,
+                    coding_config,
+                    &strategy,
+                ) {
+                    Ok(block) => block,
+                    Err(error) => {
+                        warn!(
+                            round = %consensus_context.round,
+                            ?error,
+                            "failed to encode proposed block"
+                        );
+                        return;
+                    }
+                };
                 erasure_timer.observe(&runtime_context);
 
                 let commitment = coded_block.commitment();
@@ -916,11 +930,11 @@ where
 
         let committee = scheme.participants();
         // No payload is valid for a known unsupported committee. Vote false rather than abstaining.
-        let Some(coding_config) = coding_config_for_committee(committee) else {
+        let Some(coding_config) = coding_config_for_committee::<C, _>(committee) else {
             warn!(
                 round = %consensus_context.round,
                 participants = committee.len(),
-                uniform = committee.is_uniform(),
+                total_weight = committee.total_weight(),
                 "coding does not support the epoch committee"
             );
             let (tx, rx) = oneshot::channel();

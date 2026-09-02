@@ -10,7 +10,10 @@ use crate::{
         ancestry::BlockProvider,
         coding::{
             Coding, shards,
-            types::{CodedBlock, coding_config_for_participants, hash_context},
+            types::{
+                CodedBlock, coding_config_for_committee, coding_config_for_participants,
+                hash_context,
+            },
         },
         config::{Config, Start},
         core::{Actor, CommitmentFallback, DigestFallback, Mailbox},
@@ -19,7 +22,10 @@ use crate::{
         standard::Standard,
     },
     simplex::{
-        scheme::bls12381_threshold::vrf as bls12381_threshold_vrf,
+        scheme::{
+            Scheme as SimplexScheme, bls12381_threshold::vrf as bls12381_threshold_vrf,
+            ed25519 as simplex_ed25519,
+        },
         types::{Activity, Context, Finalization, Finalize, Notarization, Notarize, Proposal},
     },
     types::{Epoch, Epocher, FixedEpocher, Height, Round, View, ViewDelta, coding::Commitment},
@@ -31,7 +37,10 @@ use commonware_coding::{CodecConfig, ReedSolomon};
 use commonware_cryptography::{
     Committable, Digest as DigestTrait, Digestible, Hasher, Signer,
     bls12381::primitives::variant::MinPk,
-    certificate::{ConstantProvider, Provider, Scoped, Verifier as _, mocks::Fixture},
+    certificate::{
+        ConstantProvider, Provider, Scheme as CertificateScheme, Scoped, Verifier as _,
+        mocks::Fixture,
+    },
     ed25519::{PrivateKey, PublicKey},
     sha256::{Digest as Sha256Digest, Sha256},
 };
@@ -52,7 +61,8 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{
-    NZU16, NZU64, NZUsize, TestRng, non_empty, probability, test_rng, vec::NonEmptyVec,
+    NZU16, NZU64, NZUsize, TestRng, TryCollect, non_empty, ordered::Committee, probability,
+    test_rng, vec::NonEmptyVec,
 };
 use futures::StreamExt;
 use rand::{
@@ -2635,38 +2645,27 @@ pub fn make_coding_block(context: CodingCtx, parent: D, height: Height, timestam
     CodingB::new::<Sha256>(context, parent, height, timestamp)
 }
 
-impl TestHarness for CodingHarness {
-    type ApplicationBlock = CodingB;
-    type Variant = CodingVariant;
-    type TestBlock = CodedBlock<CodingB, ReedSolomon<Sha256>, Sha256>;
-    type ValidatorExtra = ShardsMailbox;
-    type Commitment = TestCommitment;
+struct CodingValidatorSetup<Sch: CertificateScheme> {
+    application: Application<CodingB>,
+    mailbox: Mailbox<Sch, CodingVariant>,
+    extra: ShardsMailbox,
+    height: Option<Height>,
+    actor_handle: commonware_runtime::Handle<()>,
+}
 
-    async fn setup_validator(
+impl CodingHarness {
+    async fn setup_validator_with_scheme<SP>(
         context: deterministic::Context,
         oracle: &mut Oracle<K, deterministic::Context>,
         validator: K,
-        provider: P,
-    ) -> ValidatorSetup<Self> {
-        Self::setup_validator_with(
-            context,
-            oracle,
-            validator,
-            provider,
-            NZUsize!(1),
-            Application::default(),
-        )
-        .await
-    }
-
-    async fn setup_validator_with(
-        context: deterministic::Context,
-        oracle: &mut Oracle<K, deterministic::Context>,
-        validator: K,
-        provider: P,
+        provider: SP,
         max_pending_acks: NonZeroUsize,
-        application: Application<Self::ApplicationBlock>,
-    ) -> ValidatorSetup<Self> {
+        application: Application<CodingB>,
+    ) -> CodingValidatorSetup<SP::Scheme>
+    where
+        SP: Provider<Scope = Epoch>,
+        SP::Scheme: CertificateScheme<PublicKey = K> + SimplexScheme<TestCommitment>,
+    {
         let config = Config {
             provider: provider.clone(),
             epocher: FixedEpocher::new(BLOCKS_PER_EPOCH),
@@ -2730,7 +2729,7 @@ impl TestHarness for CodingHarness {
                     config.partition_prefix
                 ),
                 items_per_section: NZU64!(10),
-                codec_config: S::certificate_codec_config_unbounded(),
+                codec_config: SP::Scheme::certificate_codec_config_unbounded(),
                 replay_buffer: config.replay_buffer,
                 freezer_key_write_buffer: config.key_write_buffer,
                 freezer_value_write_buffer: config.value_write_buffer,
@@ -2807,12 +2806,63 @@ impl TestHarness for CodingHarness {
         .await;
         let actor_handle = actor.start(application.clone(), shard_mailbox.clone(), resolver);
 
-        ValidatorSetup {
+        CodingValidatorSetup {
             application,
             mailbox,
             extra: shard_mailbox,
             height: floor.height(),
             actor_handle,
+        }
+    }
+}
+
+impl TestHarness for CodingHarness {
+    type ApplicationBlock = CodingB;
+    type Variant = CodingVariant;
+    type TestBlock = CodedBlock<CodingB, ReedSolomon<Sha256>, Sha256>;
+    type ValidatorExtra = ShardsMailbox;
+    type Commitment = TestCommitment;
+
+    async fn setup_validator(
+        context: deterministic::Context,
+        oracle: &mut Oracle<K, deterministic::Context>,
+        validator: K,
+        provider: P,
+    ) -> ValidatorSetup<Self> {
+        Self::setup_validator_with(
+            context,
+            oracle,
+            validator,
+            provider,
+            NZUsize!(1),
+            Application::default(),
+        )
+        .await
+    }
+
+    async fn setup_validator_with(
+        context: deterministic::Context,
+        oracle: &mut Oracle<K, deterministic::Context>,
+        validator: K,
+        provider: P,
+        max_pending_acks: NonZeroUsize,
+        application: Application<Self::ApplicationBlock>,
+    ) -> ValidatorSetup<Self> {
+        let setup = Self::setup_validator_with_scheme(
+            context,
+            oracle,
+            validator,
+            provider,
+            max_pending_acks,
+            application,
+        )
+        .await;
+        ValidatorSetup {
+            application: setup.application,
+            mailbox: setup.mailbox,
+            extra: setup.extra,
+            height: setup.height,
+            actor_handle: setup.actor_handle,
         }
     }
 
@@ -3049,6 +3099,145 @@ impl TestHarness for CodingHarness {
     ) {
         assert!(handle.mailbox.verified(round, block.clone()).await);
     }
+}
+
+/// Proves a drained committee upgrade preserves finalized blocks encoded with the old config.
+pub fn drained_weighted_upgrade_retains_finalized_config() {
+    let runner = deterministic::Runner::new(
+        deterministic::Config::new()
+            .with_seed(0x4598)
+            .with_timeout(Some(Duration::from_secs(60))),
+    );
+    let ((participants, private_keys, old_config, expected_digest), checkpoint) = runner
+        .start_and_recover(|mut context| async move {
+            let Fixture {
+                participants,
+                private_keys,
+                schemes,
+                ..
+            } = simplex_ed25519::fixture(&mut context, NAMESPACE, NUM_VALIDATORS);
+            let old_config =
+                coding_config_for_committee::<ReedSolomon<Sha256>, _>(schemes[0].participants())
+                    .expect("uniform committee must support coding");
+            let mut oracle = setup_network_with_participants(
+                context.child("network"),
+                NZUsize!(1),
+                participants.clone(),
+            )
+            .await;
+            let mut setup = CodingHarness::setup_validator_with_scheme(
+                context.child("validator").with_attribute("phase", 1),
+                &mut oracle,
+                participants[0].clone(),
+                ConstantProvider::new(schemes[0].clone()),
+                NZUsize!(1),
+                Application::default(),
+            )
+            .await;
+
+            let height = Height::new(1);
+            let round = Round::new(Epoch::zero(), View::new(1));
+            let block = CodingHarness::make_test_block(
+                Sha256::hash(&[b""]),
+                genesis_commitment(),
+                height,
+                1,
+                NUM_VALIDATORS as u16,
+            );
+            let commitment = block.commitment();
+            let expected_digest = block.digest();
+            assert_eq!(commitment.config(), old_config);
+            assert!(setup.mailbox.verified(round, block).await);
+
+            let proposal = Proposal::new(round, View::zero(), commitment);
+            let finalizes: Vec<_> = schemes
+                .iter()
+                .take(QUORUM as usize)
+                .map(|scheme| Finalize::sign(scheme, proposal.clone()).unwrap())
+                .collect();
+            let finalization = Finalization::from_finalizes(
+                &schemes[0],
+                non_empty![@&finalizes],
+                &Sequential,
+            )
+            .unwrap();
+            setup
+                .mailbox
+                .report(Activity::Finalization(finalization));
+
+            while setup.application.tip().map(|(tip, _)| tip) != Some(height)
+                || setup.mailbox.get_processed_height().await != Some(height)
+            {
+                context.sleep(Duration::from_millis(10)).await;
+            }
+            let stored = setup
+                .mailbox
+                .get_block(height)
+                .await
+                .expect("finalized block must be readable before upgrade");
+            assert_eq!(stored.digest(), expected_digest);
+            let stored_finalization = setup
+                .mailbox
+                .get_finalization(height)
+                .await
+                .expect("finalization must be durable before upgrade");
+            assert_eq!(stored_finalization.proposal.payload.config(), old_config);
+
+            (participants, private_keys, old_config, expected_digest)
+        });
+
+    deterministic::Runner::from(checkpoint).start(move |context| async move {
+        let committee = participants
+            .iter()
+            .cloned()
+            .zip([7, 1, 1, 1])
+            .try_collect::<Committee<_>>()
+            .unwrap();
+        let weighted_scheme = simplex_ed25519::Scheme::signer(
+            NAMESPACE,
+            committee,
+            private_keys[0].clone(),
+        )
+        .expect("the restarted validator identity must remain in the committee");
+        let new_config = coding_config_for_committee::<ReedSolomon<Sha256>, _>(
+            weighted_scheme.participants(),
+        )
+        .expect("weighted committee must support coding");
+        assert_ne!(new_config, old_config);
+
+        let mut oracle = setup_network_with_participants(
+            context.child("network"),
+            NZUsize!(1),
+            participants.clone(),
+        )
+        .await;
+        let restart = CodingHarness::setup_validator_with_scheme(
+            context.child("validator").with_attribute("phase", 2),
+            &mut oracle,
+            participants[0].clone(),
+            ConstantProvider::new(weighted_scheme),
+            NZUsize!(1),
+            Application::default(),
+        )
+        .await;
+
+        let height = Height::new(1);
+        assert_eq!(restart.height, Some(height));
+        assert_eq!(restart.mailbox.get_processed_height().await, Some(height));
+        let recovered = restart
+            .mailbox
+            .get_block(height)
+            .await
+            .expect("finalized pre-activation block must survive restart");
+        assert_eq!(recovered.digest(), expected_digest);
+        let recovered_finalization = restart
+            .mailbox
+            .get_finalization(height)
+            .await
+            .expect("finalized commitment must survive restart");
+        assert_eq!(recovered_finalization.proposal.payload.config(), old_config);
+        assert_ne!(recovered_finalization.proposal.payload.config(), new_config);
+    });
 }
 
 // =============================================================================
